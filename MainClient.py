@@ -17,7 +17,10 @@ except ImportError:
     print("Установите её командой: pip install tqdm")
 
 # имя клиента по умолчанию
-CLIENT_NAME = "default_client"
+CLIENT_NAME = "R2.0S"
+
+# Размер чанка для передачи данных (64 KB) - должен совпадать с размером на сервере
+CHUNK_SIZE = 65536
 
 
 class ImageClient:
@@ -62,7 +65,7 @@ class ImageClient:
     
     def _send_data(self, data, show_progress=False, desc="Отправка"):
         """
-        Отправляет данные в сокет
+        Отправляет данные в сокет чанками для корректного отслеживания прогресса
         
         Args:
             data: Данные для отправки (bytes)
@@ -74,21 +77,41 @@ class ImageClient:
         """
         total_sent = 0
         data_len = len(data)
+        # Размер чанка для отправки - используем общую константу
+        chunk_size = CHUNK_SIZE
         
         if show_progress and TQDM_AVAILABLE:
-            with tqdm(total=data_len, unit='B', unit_scale=True, unit_divisor=1024, desc=desc, ncols=80) as pbar:
+            # bar_format с отображением скорости: {rate_fmt} показывает текущую скорость
+            bar_format = '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            with tqdm(total=data_len, unit='B', unit_scale=True, unit_divisor=1024, 
+                      desc=desc, ncols=100, bar_format=bar_format) as pbar:
                 while total_sent < data_len:
-                    sent = self.client_socket.send(data[total_sent:])
-                    if sent == 0:
-                        raise ConnectionError("Соединение разорвано")
-                    total_sent += sent
-                    pbar.update(sent)
+                    try:
+                        # Определяем размер текущего чанка
+                        end = min(total_sent + chunk_size, data_len)
+                        chunk = data[total_sent:end]
+                        # Используем sendall для гарантированной отправки всего чанка
+                        self.client_socket.sendall(chunk)
+                        sent = len(chunk)
+                        total_sent += sent
+                        pbar.update(sent)
+                    except socket.timeout:
+                        self.logger.error("Таймаут при отправке данных")
+                        raise ConnectionError("Превышено время ожидания при отправке данных")
+                    except socket.error as e:
+                        self.logger.error(f"Ошибка сокета при отправке: {e}")
+                        raise
         else:
             while total_sent < data_len:
-                sent = self.client_socket.send(data[total_sent:])
-                if sent == 0:
-                    raise ConnectionError("Соединение разорвано")
-                total_sent += sent
+                try:
+                    end = min(total_sent + chunk_size, data_len)
+                    chunk = data[total_sent:end]
+                    self.client_socket.sendall(chunk)
+                    total_sent += len(chunk)
+                except socket.timeout:
+                    raise ConnectionError("Превышено время ожидания при отправке данных")
+                except socket.error as e:
+                    raise ConnectionError(f"Ошибка сокета при отправке: {e}")
                 
         return total_sent
     
@@ -102,9 +125,16 @@ class ImageClient:
         try:
             self.logger.info(f"Подключение к серверу {self.server_ip}:{self.server_port}...")
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Устанавливаем таймауты для предотвращения зависания
+            self.client_socket.settimeout(30.0)  # 30 секунд на операции
+            # Отключаем алгоритм Нейгла для немедленной отправки данных
+            self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.client_socket.connect((self.server_ip, self.server_port))
             self.logger.info("Подключение установлено")
             return True
+        except socket.timeout:
+            self.logger.error(f"Таймаут при подключении к серверу {self.server_ip}:{self.server_port}")
+            return False
         except ConnectionRefusedError:
             self.logger.error(f"Не удалось подключиться к серверу {self.server_ip}:{self.server_port}")
             self.logger.warning("Убедитесь, что сервер запущен")
@@ -156,14 +186,36 @@ class ImageClient:
             
             self.logger.info(f"Изображение отправлено ({total_sent} байт)")
             
-            # Ждем подтверждение от сервера
-            response = self.client_socket.recv(2)
-            if response == b'OK':
-                self.logger.info("Сервер подтвердил получение изображения")
-                return True
-            else:
-                self.logger.warning("Получен неожиданный ответ от сервера")
+            # Проверяем, что все данные были отправлены
+            if total_sent != image_size:
+                self.logger.error(f"Несоответствие размера: отправлено {total_sent} байт, ожидалось {image_size} байт")
                 return False
+            
+            # Ждем подтверждение от сервера с таймаутом
+            original_timeout = self.client_socket.gettimeout()
+            try:
+                self.client_socket.settimeout(10.0)  # 10 секунд на получение ответа
+                response = self.client_socket.recv(2)
+                if response == b'OK':
+                    self.logger.info("Сервер подтвердил получение изображения")
+                    result = True
+                elif response == b'ER':
+                    self.logger.error("Сервер вернул ошибку (возможно, размер изображения слишком большой)")
+                    result = False
+                else:
+                    self.logger.warning(f"Получен неожиданный ответ от сервера: {response}")
+                    result = False
+            except socket.timeout:
+                self.logger.warning("Таймаут при ожидании ответа от сервера")
+                result = False
+            except socket.error as e:
+                self.logger.error(f"Ошибка при получении ответа от сервера: {e}")
+                result = False
+            finally:
+                # Восстанавливаем исходный таймаут
+                self.client_socket.settimeout(original_timeout)
+            
+            return result
             
         except Exception as e:
             self.logger.error(f"Ошибка при отправке изображения: {e}")
