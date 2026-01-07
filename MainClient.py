@@ -19,9 +19,9 @@ except ImportError:
 # имя клиента по умолчанию
 CLIENT_NAME = "R2.0S"
 
-# Размер чанка для передачи данных (256 KB) - должен совпадать с размером на сервере
-# Увеличенный размер чанка повышает производительность передачи
-CHUNK_SIZE = 262144  # 256 KB
+# Размер чанка для передачи данных (1 MB) - должен совпадать с размером на сервере
+# Больший чанк снижает накладные расходы на syscalls и копирование
+CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 
 class ImageClient:
@@ -53,16 +53,53 @@ class ImageClient:
         }
         self.logger = Logger(logger_config)
     
-    def _send_string(self, string):
+    def _pack_string(self, string):
         """
-        Отправляет строку в сокет (сначала длина, затем данные)
+        Упаковывает строку для отправки (сначала длина, затем данные)
         
         Args:
             string: Строка для отправки
         """
         string_bytes = string.encode('utf-8')
-        self.client_socket.send(struct.pack('!I', len(string_bytes)))
-        self.client_socket.send(string_bytes)
+        return struct.pack('!I', len(string_bytes)) + string_bytes
+
+    def _send_header(self, filename, image_size):
+        """
+        Отправляет заголовок одним sendall (меньше syscalls/пакетов).
+        Формат: client_name(str) + image_size(uint32) + filename(str)
+        """
+        header = (
+            self._pack_string(self.client_name) +
+            struct.pack('!I', image_size) +
+            self._pack_string(filename)
+        )
+        self.client_socket.sendall(header)
+
+    def _send_file_stream(self, file_obj, size, show_progress=False, desc="Отправка"):
+        """
+        Потоково отправляет файл, не читая его целиком в память.
+        """
+        sent_total = 0
+        if show_progress and TQDM_AVAILABLE:
+            bar_format = '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            with tqdm(total=size, unit='B', unit_scale=True, unit_divisor=1024,
+                      desc=desc, ncols=100, bar_format=bar_format) as pbar:
+                while sent_total < size:
+                    chunk = file_obj.read(min(CHUNK_SIZE, size - sent_total))
+                    if not chunk:
+                        break
+                    self.client_socket.sendall(chunk)
+                    sent_total += len(chunk)
+                    pbar.update(len(chunk))
+        else:
+            while sent_total < size:
+                chunk = file_obj.read(min(CHUNK_SIZE, size - sent_total))
+                if not chunk:
+                    break
+                self.client_socket.sendall(chunk)
+                sent_total += len(chunk)
+
+        return sent_total
     
     def _send_data(self, data, show_progress=False, desc="Отправка"):
         """
@@ -131,9 +168,9 @@ class ImageClient:
             # Отключаем алгоритм Нейгла для немедленной отправки данных
             self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             # Увеличиваем размер приемного буфера для повышения производительности
-            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)  # 1 MB
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)  # 4 MB
             # Увеличиваем размер отправного буфера
-            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)  # 1 MB
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)  # 4 MB
             self.client_socket.connect((self.server_ip, self.server_port))
             self.logger.info("Подключение установлено")
             return True
@@ -167,28 +204,18 @@ class ImageClient:
                 return False
         
         try:
-            # Читаем изображение с буферизацией для повышения производительности
-            # Используем буфер размером 1 MB для чтения файла
-            with open(image_path, 'rb', buffering=1048576) as f:
-                image_data = f.read()
-            
-            image_size = len(image_data)
             filename = os.path.basename(image_path)
+            image_size = os.path.getsize(image_path)
             
             self.logger.debug(f"Имя клиента: {self.client_name}")
             self.logger.info(f"Отправка изображения: {filename} ({image_size} байт)")
-            
-            # Отправляем имя клиента
-            self._send_string(self.client_name)
-            
-            # Отправляем размер изображения
-            self.client_socket.send(struct.pack('!I', image_size))
-            
-            # Отправляем имя файла
-            self._send_string(filename)
-            
-            # Отправляем само изображение с прогресс-баром
-            total_sent = self._send_data(image_data, show_progress=True, desc=f"Отправка {filename}")
+
+            # Заголовок одним sendall
+            self._send_header(filename=filename, image_size=image_size)
+
+            # Отправляем файл потоково (без загрузки целиком в RAM)
+            with open(image_path, 'rb', buffering=4 * 1024 * 1024) as f:
+                total_sent = self._send_file_stream(f, image_size, show_progress=True, desc=f"Отправка {filename}")
             
             self.logger.info(f"Изображение отправлено ({total_sent} байт)")
             
