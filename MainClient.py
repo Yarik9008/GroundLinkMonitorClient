@@ -8,6 +8,13 @@ import sys
 import os
 from datetime import datetime
 from Logger import Logger
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Внимание: библиотека tqdm не установлена. Прогресс-бар отключен.")
+    print("Установите её командой: pip install tqdm")
 
 # имя клиента по умолчанию
 CLIENT_NAME = "default_client"
@@ -53,19 +60,36 @@ class ImageClient:
         self.client_socket.send(struct.pack('!I', len(string_bytes)))
         self.client_socket.send(string_bytes)
     
-    def _send_data(self, data):
+    def _send_data(self, data, show_progress=False, desc="Отправка"):
         """
         Отправляет данные в сокет
         
         Args:
             data: Данные для отправки (bytes)
+            show_progress: Показывать ли прогресс-бар
+            desc: Описание для прогресс-бара
+        
+        Returns:
+            int: Количество отправленных байт
         """
         total_sent = 0
-        while total_sent < len(data):
-            sent = self.client_socket.send(data[total_sent:])
-            if sent == 0:
-                raise ConnectionError("Соединение разорвано")
-            total_sent += sent
+        data_len = len(data)
+        
+        if show_progress and TQDM_AVAILABLE:
+            with tqdm(total=data_len, unit='B', unit_scale=True, unit_divisor=1024, desc=desc, ncols=80) as pbar:
+                while total_sent < data_len:
+                    sent = self.client_socket.send(data[total_sent:])
+                    if sent == 0:
+                        raise ConnectionError("Соединение разорвано")
+                    total_sent += sent
+                    pbar.update(sent)
+        else:
+            while total_sent < data_len:
+                sent = self.client_socket.send(data[total_sent:])
+                if sent == 0:
+                    raise ConnectionError("Соединение разорвано")
+                total_sent += sent
+                
         return total_sent
     
     def connect(self):
@@ -127,8 +151,8 @@ class ImageClient:
             # Отправляем имя файла
             self._send_string(filename)
             
-            # Отправляем само изображение
-            total_sent = self._send_data(image_data)
+            # Отправляем само изображение с прогресс-баром
+            total_sent = self._send_data(image_data, show_progress=True, desc=f"Отправка {filename}")
             
             self.logger.info(f"Изображение отправлено ({total_sent} байт)")
             
