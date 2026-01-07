@@ -19,8 +19,9 @@ except ImportError:
 # имя клиента по умолчанию
 CLIENT_NAME = "R2.0S"
 
-# Размер чанка для передачи данных (64 KB) - должен совпадать с размером на сервере
-CHUNK_SIZE = 65536
+# Размер чанка для передачи данных (256 KB) - должен совпадать с размером на сервере
+# Увеличенный размер чанка повышает производительность передачи
+CHUNK_SIZE = 262144  # 256 KB
 
 
 class ImageClient:
@@ -129,6 +130,10 @@ class ImageClient:
             self.client_socket.settimeout(30.0)  # 30 секунд на операции
             # Отключаем алгоритм Нейгла для немедленной отправки данных
             self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Увеличиваем размер приемного буфера для повышения производительности
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)  # 1 MB
+            # Увеличиваем размер отправного буфера
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)  # 1 MB
             self.client_socket.connect((self.server_ip, self.server_port))
             self.logger.info("Подключение установлено")
             return True
@@ -162,8 +167,9 @@ class ImageClient:
                 return False
         
         try:
-            # Читаем изображение
-            with open(image_path, 'rb') as f:
+            # Читаем изображение с буферизацией для повышения производительности
+            # Используем буфер размером 1 MB для чтения файла
+            with open(image_path, 'rb', buffering=1048576) as f:
                 image_data = f.read()
             
             image_size = len(image_data)
