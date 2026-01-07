@@ -23,6 +23,10 @@ CLIENT_NAME = "R2.0S"
 # Больший чанк снижает накладные расходы на syscalls и копирование
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
+# Таймауты (секунды)
+CONNECT_TIMEOUT = 10.0
+RESPONSE_TIMEOUT = 30.0
+
 
 class ImageClient:
     """Класс клиента для отправки изображений на сервер"""
@@ -163,8 +167,9 @@ class ImageClient:
         try:
             self.logger.info(f"Подключение к серверу {self.server_ip}:{self.server_port}...")
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Устанавливаем таймауты для предотвращения зависания
-            self.client_socket.settimeout(30.0)  # 30 секунд на операции
+            # Таймаут только на подключение; передачу файла делаем без таймаута,
+            # чтобы большой файл по медленному каналу не обрывался.
+            self.client_socket.settimeout(CONNECT_TIMEOUT)
             # Отключаем алгоритм Нейгла для немедленной отправки данных
             self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             # Увеличиваем размер приемного буфера для повышения производительности
@@ -172,6 +177,8 @@ class ImageClient:
             # Увеличиваем размер отправного буфера
             self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)  # 4 MB
             self.client_socket.connect((self.server_ip, self.server_port))
+            # Без таймаута на sendall во время передачи
+            self.client_socket.settimeout(None)
             self.logger.info("Подключение установлено")
             return True
         except socket.timeout:
@@ -227,7 +234,7 @@ class ImageClient:
             # Ждем подтверждение от сервера с таймаутом
             original_timeout = self.client_socket.gettimeout()
             try:
-                self.client_socket.settimeout(10.0)  # 10 секунд на получение ответа
+                self.client_socket.settimeout(RESPONSE_TIMEOUT)
                 response = self.client_socket.recv(2)
                 if response == b'OK':
                     self.logger.info("Сервер подтвердил получение изображения")
