@@ -32,12 +32,13 @@ class ImageClient:
         self.client_socket = None
         
         # Создаем директорию для логов
-        os.makedirs('logs', exist_ok=True)
+        logs_dir = "/root/lorett/GroundLinkMonitorClient/logs"
+        os.makedirs(logs_dir, exist_ok=True)
         
         # Инициализация логгера
         logger_config = {
             'log_level': log_level,
-            'path_log': f'logs/image_client_{client_name}_'
+            'path_log': f'/root/lorett/GroundLinkMonitorClient/logs/image_client_{client_name}_'
         }
         self.logger = Logger(logger_config)
     
@@ -165,7 +166,7 @@ if __name__ == "__main__":
     """Основная функция"""
     if len(sys.argv) < 2:
         print("Использование: python MainClient.py <путь_к_изображению>")
-        print("Пример: python MainClient.py /path/to/image.jpg")
+        print("Пример: python MainClient.py C:\\path\\to\\image.jpg")
         sys.exit(1)
     
     image_path = sys.argv[1]
