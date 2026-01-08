@@ -29,6 +29,8 @@ CHUNK_SIZE = 1024 * 1024  # 1 MB
 CONNECT_TIMEOUT = 10.0
 RESPONSE_TIMEOUT = 30.0
 OFFSET_TIMEOUT = 30.0
+# Если канал "завис" (нет возможности сбросить данные в ОС), форсируем переподключение
+DRAIN_TIMEOUT = 30.0
 
 # Повторы при разрыве связи
 MAX_RETRIES = 0  # 0 = бесконечно
@@ -126,7 +128,8 @@ class ImageClient:
                     if not chunk:
                         break
                     writer.write(chunk)
-                    await writer.drain()
+                    # Если сеть "зависла", drain может ждать бесконечно — ограничиваем
+                    await asyncio.wait_for(writer.drain(), timeout=DRAIN_TIMEOUT)
                     sent_total += len(chunk)
                     pbar.update(len(chunk))
         else:
@@ -135,7 +138,7 @@ class ImageClient:
                 if not chunk:
                     break
                 writer.write(chunk)
-                await writer.drain()
+                await asyncio.wait_for(writer.drain(), timeout=DRAIN_TIMEOUT)
                 sent_total += len(chunk)
 
         return sent_total
@@ -159,6 +162,7 @@ class ImageClient:
             if isinstance(sock, socket.socket):
                 try:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
                 except Exception:
