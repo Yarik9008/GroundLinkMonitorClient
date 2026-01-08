@@ -2,11 +2,12 @@
 """
 Клиент для отправки изображений на сервер
 """
-import socket
 import struct
 import sys
 import os
-from datetime import datetime
+import asyncio
+import socket
+from typing import Optional
 from Logger import Logger
 try:
     from tqdm import tqdm
@@ -56,6 +57,8 @@ class ImageClient:
             'path_log': f'/root/lorett/GroundLinkMonitorClient/logs/image_client_{client_name}_'
         }
         self.logger = Logger(logger_config)
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
     
     def _pack_string(self, string):
         """
@@ -67,23 +70,27 @@ class ImageClient:
         string_bytes = string.encode('utf-8')
         return struct.pack('!I', len(string_bytes)) + string_bytes
 
-    def _send_header(self, filename, image_size):
+    def _build_header(self, filename, image_size):
         """
-        Отправляет заголовок одним sendall (меньше syscalls/пакетов).
+        Собирает заголовок одним куском (меньше syscalls/пакетов).
         Формат: client_name(str) + image_size(uint32) + filename(str)
         """
-        header = (
+        return (
             self._pack_string(self.client_name) +
             struct.pack('!I', image_size) +
             self._pack_string(filename)
         )
-        self.client_socket.sendall(header)
 
-    def _send_file_stream(self, file_obj, size, show_progress=False, desc="Отправка"):
+    async def _send_file_stream(self, file_obj, size, show_progress=False, desc="Отправка"):
         """
         Потоково отправляет файл, не читая его целиком в память.
         """
+        if not self._writer:
+            raise ConnectionError("Нет подключения к серверу")
+
+        writer = self._writer
         sent_total = 0
+
         if show_progress and TQDM_AVAILABLE:
             bar_format = '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
             with tqdm(total=size, unit='B', unit_scale=True, unit_divisor=1024,
@@ -92,7 +99,8 @@ class ImageClient:
                     chunk = file_obj.read(min(CHUNK_SIZE, size - sent_total))
                     if not chunk:
                         break
-                    self.client_socket.sendall(chunk)
+                    writer.write(chunk)
+                    await writer.drain()
                     sent_total += len(chunk)
                     pbar.update(len(chunk))
         else:
@@ -100,64 +108,13 @@ class ImageClient:
                 chunk = file_obj.read(min(CHUNK_SIZE, size - sent_total))
                 if not chunk:
                     break
-                self.client_socket.sendall(chunk)
+                writer.write(chunk)
+                await writer.drain()
                 sent_total += len(chunk)
 
         return sent_total
     
-    def _send_data(self, data, show_progress=False, desc="Отправка"):
-        """
-        Отправляет данные в сокет чанками для корректного отслеживания прогресса
-        
-        Args:
-            data: Данные для отправки (bytes)
-            show_progress: Показывать ли прогресс-бар
-            desc: Описание для прогресс-бара
-        
-        Returns:
-            int: Количество отправленных байт
-        """
-        total_sent = 0
-        data_len = len(data)
-        # Размер чанка для отправки - используем общую константу
-        chunk_size = CHUNK_SIZE
-        
-        if show_progress and TQDM_AVAILABLE:
-            # bar_format с отображением скорости: {rate_fmt} показывает текущую скорость
-            bar_format = '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
-            with tqdm(total=data_len, unit='B', unit_scale=True, unit_divisor=1024, 
-                      desc=desc, ncols=100, bar_format=bar_format) as pbar:
-                while total_sent < data_len:
-                    try:
-                        # Определяем размер текущего чанка
-                        end = min(total_sent + chunk_size, data_len)
-                        chunk = data[total_sent:end]
-                        # Используем sendall для гарантированной отправки всего чанка
-                        self.client_socket.sendall(chunk)
-                        sent = len(chunk)
-                        total_sent += sent
-                        pbar.update(sent)
-                    except socket.timeout:
-                        self.logger.error("Таймаут при отправке данных")
-                        raise ConnectionError("Превышено время ожидания при отправке данных")
-                    except socket.error as e:
-                        self.logger.error(f"Ошибка сокета при отправке: {e}")
-                        raise
-        else:
-            while total_sent < data_len:
-                try:
-                    end = min(total_sent + chunk_size, data_len)
-                    chunk = data[total_sent:end]
-                    self.client_socket.sendall(chunk)
-                    total_sent += len(chunk)
-                except socket.timeout:
-                    raise ConnectionError("Превышено время ожидания при отправке данных")
-                except socket.error as e:
-                    raise ConnectionError(f"Ошибка сокета при отправке: {e}")
-                
-        return total_sent
-    
-    def connect(self):
+    async def connect(self):
         """
         Подключается к серверу
         
@@ -166,22 +123,24 @@ class ImageClient:
         """
         try:
             self.logger.info(f"Подключение к серверу {self.server_ip}:{self.server_port}...")
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Таймаут только на подключение; передачу файла делаем без таймаута,
-            # чтобы большой файл по медленному каналу не обрывался.
-            self.client_socket.settimeout(CONNECT_TIMEOUT)
-            # Отключаем алгоритм Нейгла для немедленной отправки данных
-            self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            # Увеличиваем размер приемного буфера для повышения производительности
-            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)  # 4 MB
-            # Увеличиваем размер отправного буфера
-            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)  # 4 MB
-            self.client_socket.connect((self.server_ip, self.server_port))
-            # Без таймаута на sendall во время передачи
-            self.client_socket.settimeout(None)
+
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(self.server_ip, self.server_port),
+                timeout=CONNECT_TIMEOUT,
+            )
+
+            sock = self._writer.get_extra_info("socket")
+            if isinstance(sock, socket.socket):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+                except Exception:
+                    pass
+
             self.logger.info("Подключение установлено")
             return True
-        except socket.timeout:
+        except asyncio.TimeoutError:
             self.logger.error(f"Таймаут при подключении к серверу {self.server_ip}:{self.server_port}")
             return False
         except ConnectionRefusedError:
@@ -192,7 +151,7 @@ class ImageClient:
             self.logger.error(f"Ошибка при подключении: {e}")
             return False
     
-    def send_image(self, image_path):
+    async def send_image(self, image_path):
         """
         Отправляет изображение на сервер
         
@@ -206,23 +165,27 @@ class ImageClient:
             self.logger.error(f"Файл {image_path} не найден")
             return False
         
-        if not self.client_socket:
-            if not self.connect():
+        if not self._writer:
+            if not await self.connect():
                 return False
         
         try:
+            if not self._writer or not self._reader:
+                raise ConnectionError("Нет подключения к серверу")
+
             filename = os.path.basename(image_path)
             image_size = os.path.getsize(image_path)
             
             self.logger.debug(f"Имя клиента: {self.client_name}")
             self.logger.info(f"Отправка изображения: {filename} ({image_size} байт)")
 
-            # Заголовок одним sendall
-            self._send_header(filename=filename, image_size=image_size)
+            # Заголовок одним write+drain
+            self._writer.write(self._build_header(filename=filename, image_size=image_size))
+            await self._writer.drain()
 
             # Отправляем файл потоково (без загрузки целиком в RAM)
             with open(image_path, 'rb', buffering=4 * 1024 * 1024) as f:
-                total_sent = self._send_file_stream(f, image_size, show_progress=True, desc=f"Отправка {filename}")
+                total_sent = await self._send_file_stream(f, image_size, show_progress=True, desc=f"Отправка {filename}")
             
             self.logger.info(f"Изображение отправлено ({total_sent} байт)")
             
@@ -231,29 +194,23 @@ class ImageClient:
                 self.logger.error(f"Несоответствие размера: отправлено {total_sent} байт, ожидалось {image_size} байт")
                 return False
             
-            # Ждем подтверждение от сервера с таймаутом
-            original_timeout = self.client_socket.gettimeout()
             try:
-                self.client_socket.settimeout(RESPONSE_TIMEOUT)
-                response = self.client_socket.recv(2)
-                if response == b'OK':
+                response = await asyncio.wait_for(self._reader.readexactly(2), timeout=RESPONSE_TIMEOUT)
+                if response == b"OK":
                     self.logger.info("Сервер подтвердил получение изображения")
                     result = True
-                elif response == b'ER':
+                elif response == b"ER":
                     self.logger.error("Сервер вернул ошибку (возможно, размер изображения слишком большой)")
                     result = False
                 else:
                     self.logger.warning(f"Получен неожиданный ответ от сервера: {response}")
                     result = False
-            except socket.timeout:
+            except asyncio.TimeoutError:
                 self.logger.warning("Таймаут при ожидании ответа от сервера")
                 result = False
-            except socket.error as e:
+            except Exception as e:
                 self.logger.error(f"Ошибка при получении ответа от сервера: {e}")
                 result = False
-            finally:
-                # Восстанавливаем исходный таймаут
-                self.client_socket.settimeout(original_timeout)
             
             return result
             
@@ -261,21 +218,27 @@ class ImageClient:
             self.logger.error(f"Ошибка при отправке изображения: {e}")
             return False
     
-    def disconnect(self):
+    async def disconnect(self):
         """Закрывает соединение с сервером"""
-        if self.client_socket:
-            self.client_socket.close()
-            self.client_socket = None
+        if self._writer:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+            self._writer = None
+            self._reader = None
             self.logger.debug("Соединение закрыто")
     
-    def __enter__(self):
-        """Контекстный менеджер: вход"""
-        self.connect()
+    async def __aenter__(self):
+        """Async контекстный менеджер: вход"""
+        await self.connect()
         return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Контекстный менеджер: выход"""
-        self.disconnect()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async контекстный менеджер: выход"""
+        await self.disconnect()
+        return False
 
 
 if __name__ == "__main__":
@@ -289,8 +252,11 @@ if __name__ == "__main__":
     
     client = ImageClient(client_name=CLIENT_NAME)
     
-    try:
-        success = client.send_image(image_path)
-        sys.exit(0 if success else 1)
-    finally:
-        client.disconnect()
+    async def _main():
+        try:
+            success = await client.send_image(image_path)
+            return 0 if success else 1
+        finally:
+            await client.disconnect()
+
+    sys.exit(asyncio.run(_main()))
