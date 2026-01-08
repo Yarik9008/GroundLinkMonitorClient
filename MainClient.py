@@ -28,7 +28,7 @@ CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
 # Таймауты (секунды)
 CONNECT_TIMEOUT = 10.0
 RESPONSE_TIMEOUT = 30.0
-OFFSET_TIMEOUT = 30.0
+OFFSET_TIMEOUT = 120.0
 # Если канал "завис" (нет возможности сбросить данные в ОС), форсируем переподключение
 DRAIN_TIMEOUT = 30.0
 
@@ -243,7 +243,10 @@ class ImageClient:
                 self._writer.write(self._build_header_v2(filename=filename, file_size=file_size, upload_id=upload_id))
                 await self._writer.drain()
 
-                offset = await asyncio.wait_for(self._read_u64(), timeout=OFFSET_TIMEOUT)
+                try:
+                    offset = await asyncio.wait_for(self._read_u64(), timeout=OFFSET_TIMEOUT)
+                except asyncio.TimeoutError as e:
+                    raise ConnectionError(f"Таймаут ожидания offset от сервера ({OFFSET_TIMEOUT}s)") from e
                 if offset > file_size:
                     raise ConnectionError(f"Сервер вернул некорректный offset={offset} > size={file_size}")
 
@@ -263,7 +266,10 @@ class ImageClient:
                 else:
                     self.logger.info("Сервер сообщает: файл уже полностью загружен, жду подтверждение")
 
-                response = await asyncio.wait_for(self._reader.readexactly(2), timeout=RESPONSE_TIMEOUT)
+                try:
+                    response = await asyncio.wait_for(self._reader.readexactly(2), timeout=RESPONSE_TIMEOUT)
+                except asyncio.TimeoutError as e:
+                    raise ConnectionError(f"Таймаут ожидания ответа OK/ER ({RESPONSE_TIMEOUT}s)") from e
                 if response == b"OK":
                     self.logger.info("Сервер подтвердил получение файла")
                     return True
@@ -275,7 +281,7 @@ class ImageClient:
 
             except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError, ConnectionError, asyncio.TimeoutError) as e:
                 attempt += 1
-                self.logger.warning(f"Разрыв/ошибка передачи: {e}. Переподключаюсь и продолжу...")
+                self.logger.warning(f"Разрыв/ошибка передачи: {type(e).__name__}: {e}. Переподключаюсь и продолжу...")
                 await self.disconnect()
                 if MAX_RETRIES and attempt >= MAX_RETRIES:
                     self.logger.error("Достигнут лимит попыток, загрузка не завершена")
