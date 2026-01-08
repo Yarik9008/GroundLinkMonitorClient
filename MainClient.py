@@ -7,6 +7,7 @@ import sys
 import os
 import asyncio
 import socket
+import hashlib
 from typing import Optional
 from Logger import Logger
 try:
@@ -27,6 +28,11 @@ CHUNK_SIZE = 1024 * 1024  # 1 MB
 # Таймауты (секунды)
 CONNECT_TIMEOUT = 10.0
 RESPONSE_TIMEOUT = 30.0
+OFFSET_TIMEOUT = 30.0
+
+# Повторы при разрыве связи
+MAX_RETRIES = 0  # 0 = бесконечно
+RETRY_DELAY_SEC = 2.0
 
 
 class ImageClient:
@@ -70,15 +76,35 @@ class ImageClient:
         string_bytes = string.encode('utf-8')
         return struct.pack('!I', len(string_bytes)) + string_bytes
 
+    def _pack_u64(self, value: int) -> bytes:
+        return struct.pack("!Q", int(value))
+
+    async def _read_u64(self) -> int:
+        if not self._reader:
+            raise ConnectionError("Нет подключения к серверу")
+        data = await self._reader.readexactly(8)
+        return struct.unpack("!Q", data)[0]
+
+    def _compute_upload_id(self, filename: str, file_size: int, image_path: str) -> str:
+        st = os.stat(image_path)
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+        seed = f"{self.client_name}|{filename}|{file_size}|{mtime_ns}".encode("utf-8")
+        return hashlib.sha256(seed).hexdigest()
+
     def _build_header(self, filename, image_size):
         """
         Собирает заголовок одним куском (меньше syscalls/пакетов).
-        Формат: client_name(str) + image_size(uint32) + filename(str)
+        Протокол v2:
+          client_name(str) + file_size(uint64) + filename(str) + upload_id(str)
         """
+        raise RuntimeError("Используйте _build_header_v2()")
+
+    def _build_header_v2(self, filename: str, file_size: int, upload_id: str) -> bytes:
         return (
-            self._pack_string(self.client_name) +
-            struct.pack('!I', image_size) +
-            self._pack_string(filename)
+            self._pack_string(self.client_name)
+            + self._pack_u64(file_size)
+            + self._pack_string(filename)
+            + self._pack_string(upload_id)
         )
 
     async def _send_file_stream(self, file_obj, size, show_progress=False, desc="Отправка"):
@@ -164,59 +190,65 @@ class ImageClient:
         if not os.path.exists(image_path):
             self.logger.error(f"Файл {image_path} не найден")
             return False
-        
-        if not self._writer:
-            if not await self.connect():
-                return False
-        
-        try:
-            if not self._writer or not self._reader:
-                raise ConnectionError("Нет подключения к серверу")
 
-            filename = os.path.basename(image_path)
-            image_size = os.path.getsize(image_path)
-            
-            self.logger.debug(f"Имя клиента: {self.client_name}")
-            self.logger.info(f"Отправка изображения: {filename} ({image_size} байт)")
+        filename = os.path.basename(image_path)
+        file_size = os.path.getsize(image_path)
+        upload_id = self._compute_upload_id(filename=filename, file_size=file_size, image_path=image_path)
 
-            # Заголовок одним write+drain
-            self._writer.write(self._build_header(filename=filename, image_size=image_size))
-            await self._writer.drain()
-
-            # Отправляем файл потоково (без загрузки целиком в RAM)
-            with open(image_path, 'rb', buffering=4 * 1024 * 1024) as f:
-                total_sent = await self._send_file_stream(f, image_size, show_progress=True, desc=f"Отправка {filename}")
-            
-            self.logger.info(f"Изображение отправлено ({total_sent} байт)")
-            
-            # Проверяем, что все данные были отправлены
-            if total_sent != image_size:
-                self.logger.error(f"Несоответствие размера: отправлено {total_sent} байт, ожидалось {image_size} байт")
-                return False
-            
+        attempt = 0
+        while True:
             try:
+                if not self._writer or not self._reader:
+                    if not await self.connect():
+                        return False
+
+                if not self._writer or not self._reader:
+                    raise ConnectionError("Нет подключения к серверу")
+
+                self.logger.info(f"Загрузка: {filename} ({file_size} байт), upload_id={upload_id}, попытка={attempt+1}")
+
+                # Отправляем заголовок v2 и получаем оффсет для продолжения
+                self._writer.write(self._build_header_v2(filename=filename, file_size=file_size, upload_id=upload_id))
+                await self._writer.drain()
+
+                offset = await asyncio.wait_for(self._read_u64(), timeout=OFFSET_TIMEOUT)
+                if offset > file_size:
+                    raise ConnectionError(f"Сервер вернул некорректный offset={offset} > size={file_size}")
+
+                remaining = file_size - offset
+                if remaining > 0:
+                    self.logger.info(f"Продолжаю с offset={offset}, осталось отправить {remaining} байт")
+                    with open(image_path, "rb", buffering=4 * 1024 * 1024) as f:
+                        f.seek(offset)
+                        sent = await self._send_file_stream(
+                            f,
+                            remaining,
+                            show_progress=True,
+                            desc=f"Отправка {filename} (resume {offset})",
+                        )
+                    if sent != remaining:
+                        raise ConnectionError(f"Отправлено {sent}/{remaining} байт (ожидалось {remaining})")
+                else:
+                    self.logger.info("Сервер сообщает: файл уже полностью загружен, жду подтверждение")
+
                 response = await asyncio.wait_for(self._reader.readexactly(2), timeout=RESPONSE_TIMEOUT)
                 if response == b"OK":
-                    self.logger.info("Сервер подтвердил получение изображения")
-                    result = True
-                elif response == b"ER":
-                    self.logger.error("Сервер вернул ошибку (возможно, размер изображения слишком большой)")
-                    result = False
-                else:
-                    self.logger.warning(f"Получен неожиданный ответ от сервера: {response}")
-                    result = False
-            except asyncio.TimeoutError:
-                self.logger.warning("Таймаут при ожидании ответа от сервера")
-                result = False
-            except Exception as e:
-                self.logger.error(f"Ошибка при получении ответа от сервера: {e}")
-                result = False
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка при отправке изображения: {e}")
-            return False
+                    self.logger.info("Сервер подтвердил получение файла")
+                    return True
+                if response == b"ER":
+                    self.logger.error("Сервер вернул ошибку")
+                    return False
+                self.logger.warning(f"Неожиданный ответ от сервера: {response!r}")
+                return False
+
+            except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError, ConnectionError, asyncio.TimeoutError) as e:
+                attempt += 1
+                self.logger.warning(f"Разрыв/ошибка передачи: {e}. Переподключаюсь и продолжу...")
+                await self.disconnect()
+                if MAX_RETRIES and attempt >= MAX_RETRIES:
+                    self.logger.error("Достигнут лимит попыток, загрузка не завершена")
+                    return False
+                await asyncio.sleep(RETRY_DELAY_SEC)
     
     async def disconnect(self):
         """Закрывает соединение с сервером"""
