@@ -1,240 +1,41 @@
 #!/usr/bin/env python3
 import asyncio
-import math
-import socket
 import sys
-import time
 from pathlib import Path
-
 import asyncssh
 
-# ====== Static config (as requested) ======
+# ====== Static config (как вы просили) ======
 SERVER_IP = "130.49.146.15"
 SERVER_PORT = 1234
 USERNAME = "sftpuser"
 PASSWORD = "sftppass123"
-# =========================================
+# ===========================================
 
-# Performance tuning (large files / high throughput)
-# Avoid frequent SSH rekey during multi-GB transfers.
-REKEY_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
-# Disable compression for max throughput (and CPU savings)
-COMPRESSION_ALGS = ["none"]
-# Prefer fast ciphers (hardware AES if available, otherwise ChaCha20)
-ENCRYPTION_ALGS = [
-    "aes128-gcm@openssh.com",
-    "aes256-gcm@openssh.com",
-    "chacha20-poly1305@openssh.com",
-    "aes128-ctr",
-    "aes256-ctr",
-]
-
-# SSH channel flow-control tuning.
-# Bigger window + packet size reduces per-packet overhead and improves throughput on high BDP links.
-# These values are negotiated; if peer can't support them, AsyncSSH will fall back.
-SSH_WINDOW = 1024 * 1024 * 1024     # 1 GiB
-SSH_MAX_PKTSIZE = 8 * 1024 * 1024   # 8 MiB
-
-# SFTP pipelining tuning.
-SFTP_BLOCK_SIZE = 16 * 1024 * 1024  # 16 MiB per request
-SFTP_MAX_REQUESTS = 4096            # aggressive pipelining
-
-# TCP socket tuning (best-effort). Requires using a pre-connected socket with asyncssh.connect(sock=...).
-USE_TUNED_SOCKET = True
-TCP_SNDBUF = 256 * 1024 * 1024      # 256 MiB
-TCP_RCVBUF = 256 * 1024 * 1024      # 256 MiB
-
-
-async def _create_tuned_connected_socket(host: str, port: int) -> socket.socket:
-    """Create a non-blocking TCP socket with aggressive buffer settings and connect it."""
-    loop = asyncio.get_running_loop()
-    infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    family, socktype, proto, _canonname, sockaddr = infos[0]
-
-    sock = socket.socket(family=family, type=socktype, proto=proto)
-    try:
-        sock.setblocking(False)
-        # Best-effort: OS may cap values.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP_SNDBUF)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP_RCVBUF)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # Optional Linux hints (ignore if unsupported)
-        if hasattr(socket, "TCP_QUICKACK"):
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
-            except OSError:
-                pass
-        await loop.sock_connect(sock, sockaddr)
-        return sock
-    except Exception:
-        try:
-            sock.close()
-        except Exception:
-            pass
-        raise
-
-
-def format_bytes(size):
-    """Format bytes to human readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size < 1024.0:
-            return f"{size:.2f} {unit}"
-        size /= 1024.0
-    return f"{size:.2f} PB"
-
-class LorettSFTPClient:
-    """Single client class: connect + upload with fast SFTP and progress bar."""
-
-    def __init__(self, host: str, port: int, username: str, password: str):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-
-    async def upload(self, local_path: str) -> None:
-        local_file = Path(local_path)
-        if not local_file.is_file():
-            raise FileNotFoundError(local_path)
-
-        filename = local_file.name
-        remote_path = f"/{filename}"
-        file_size = local_file.stat().st_size
-
-        def _is_winerror_121(exc: BaseException) -> bool:
-            if not isinstance(exc, OSError):
-                return False
-            if getattr(exc, "winerror", None) == 121:
-                return True
-            if getattr(exc, "errno", None) == 121:
-                return True
-            return "WinError 121" in str(exc)
-
-        max_attempts = 5
-        backoff = 2.0
-
-        for attempt in range(1, max_attempts + 1):
-            print(f"[client] Connecting to {self.host}:{self.port}... (attempt {attempt}/{max_attempts})")
-            try:
-                sock = None
-                if USE_TUNED_SOCKET:
-                    sock = await _create_tuned_connected_socket(self.host, self.port)
-
-                async with asyncssh.connect(
-                    sock=sock,
-                    username=self.username,
-                    password=self.password,
-                    known_hosts=None,  # demo / no host key verification
-                    rekey_bytes=REKEY_BYTES,
-                    compression_algs=COMPRESSION_ALGS,
-                    encryption_algs=ENCRYPTION_ALGS,
-                    window=SSH_WINDOW,
-                    max_pktsize=SSH_MAX_PKTSIZE,
-                    # Keepalives reduce chance of long-transfer timeouts
-                    keepalive_interval=15,
-                    keepalive_count_max=3,
-                ) as conn:
-                    print("[client] Connected! Starting SFTP session...")
-
-                    async with conn.start_sftp_client() as sftp:
-                        # best-effort cleanup of partial file from previous attempts
-                        if attempt > 1:
-                            try:
-                                await sftp.remove(remote_path)
-                            except Exception:
-                                pass
-
-                        print(f"[client] File: {filename} ({format_bytes(file_size)})")
-
-                        # Fast path: asyncssh optimized uploader
-                        block_size = SFTP_BLOCK_SIZE
-                        max_requests = SFTP_MAX_REQUESTS
-
-                        # Built-in asyncssh progress_handler.
-                        # We render a progress bar and update it strictly once per second.
-                        is_tty = sys.stderr.isatty()
-                        bar_width = 30
-                        start_ts = time.monotonic()
-                        last_print_ts = start_ts
-
-                        def _render(bytes_copied: int, total_bytes: int) -> str:
-                            total = max(1, total_bytes)
-                            pct = min(100.0, (bytes_copied / total) * 100.0)
-                            filled = int((pct / 100.0) * bar_width)
-                            bar = "#" * filled + "-" * (bar_width - filled)
-                            elapsed = max(0.001, time.monotonic() - start_ts)
-                            rate = bytes_copied / elapsed
-                            eta = (total - bytes_copied) / rate if rate > 0 else math.inf
-                            eta_str = "?" if not math.isfinite(eta) else f"{int(eta)}s"
-                            return (
-                                f"\rUploading {filename} [{bar}] {pct:6.2f}% "
-                                f"{format_bytes(bytes_copied)}/{format_bytes(total_bytes)} "
-                                f"{format_bytes(rate)}/s ETA {eta_str}"
-                            )
-
-                        def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
-                            nonlocal last_print_ts
-                            if not is_tty:
-                                return
-                            now = time.monotonic()
-                            # strictly once per second, plus final update
-                            if bytes_copied >= total_bytes or now - last_print_ts >= 1.0:
-                                last_print_ts = now
-                                sys.stderr.write(_render(bytes_copied, total_bytes))
-                                sys.stderr.flush()
-
-                        await sftp.put(
-                            str(local_file),
-                            remote_path,
-                            block_size=block_size,
-                            max_requests=max_requests,
-                            sparse=False,
-                            progress_handler=progress_handler,
-                        )
-
-                        if is_tty:
-                            sys.stderr.write(_render(file_size, file_size) + "\n")
-                            sys.stderr.flush()
-
-                        print("[client] ✓ Upload complete!")
-                        attrs = await sftp.stat(remote_path)
-                        print(f"[client] Remote file size: {format_bytes(attrs.size)}")
-                        return
-            except asyncssh.PermissionDenied:
-                print("[client] Error: Permission denied (check username/password)")
-                raise SystemExit(1)
-            except asyncssh.Error as e:
-                cause = getattr(e, "__cause__", None)
-                if _is_winerror_121(e) or (cause is not None and _is_winerror_121(cause)):
-                    print("[client] Warning: WinError 121 (semaphore timeout). Retrying...")
-                else:
-                    print(f"[client] SSH Error: {e}")
-                    raise SystemExit(1)
-            except OSError as e:
-                if _is_winerror_121(e):
-                    print("[client] Warning: WinError 121 (semaphore timeout). Retrying...")
-                else:
-                    print(f"[client] OS Error: {e}")
-                    raise SystemExit(1)
-
-            if attempt < max_attempts:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
-            else:
-                raise SystemExit("[client] Failed after retries (WinError 121).")
+REMOTE_DIR = "/"  # внутри chroot это uploads/
 
 
 async def main():
     if len(sys.argv) < 2:
-        print("Usage: python MainClient.py <path_to_file>")
+        print("Usage: python client.py <path_to_file>")
         raise SystemExit(2)
 
-    client = LorettSFTPClient(SERVER_IP, SERVER_PORT, USERNAME, PASSWORD)
-    await client.upload(sys.argv[1])
+    local_path = Path(sys.argv[1])
+    if not local_path.is_file():
+        raise SystemExit(f"File not found: {local_path}")
+
+    async with asyncssh.connect(
+        SERVER_IP,
+        port=SERVER_PORT,
+        username=USERNAME,
+        password=PASSWORD,
+        known_hosts=None,  # для простоты (в проде лучше проверять host key)
+    ) as conn:
+        async with conn.start_sftp_client() as sftp:
+            remote_path = f"{REMOTE_DIR}{local_path.name}"
+            await sftp.put(str(local_path), remote_path)
+
+    print(f"[client] Uploaded: {local_path} -> {remote_path}")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[client] Interrupted by user")
-        sys.exit(130)
+    asyncio.run(main())
