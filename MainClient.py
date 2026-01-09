@@ -22,6 +22,10 @@ DEFAULT_KEY_PATH = Path.home() / ".ssh" / "lorett_sftp_ed25519"
 # Для простоты (в проде лучше хранить known_hosts)
 SFTP_STRICT_HOSTKEY = False
 
+# По умолчанию НЕ спрашиваем пароль интерактивно (чтобы запуск был полностью автоматический).
+# Если нужно вернуть старое поведение, установите LORETT_ALLOW_INTERACTIVE_PASSWORD=1
+ALLOW_INTERACTIVE_PASSWORD = os.environ.get("LORETT_ALLOW_INTERACTIVE_PASSWORD", "0") == "1"
+
 
 def _which(cmd: str) -> str | None:
     from shutil import which
@@ -91,6 +95,10 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
             *opts,
             "-o",
             f"BatchMode={bm}",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "PasswordAuthentication=no",
             f"{USERNAME}@{SERVER_IP}",
         ]
 
@@ -135,21 +143,49 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
         if proc_pw.returncode == 0:
             return
 
-    # 3) Если ключ не установлен, но запуск интерактивный — дадим шанс ввести пароль.
-    if sys.stdin.isatty():
-        print("[client] Key auth failed; falling back to interactive password prompt...")
-        proc2 = subprocess.run(build_cmd(batch_mode=False), input=batch, text=True)
+    # 3) Интерактивный ввод пароля отключён по умолчанию (чтобы не "спрашивало пароль").
+    if ALLOW_INTERACTIVE_PASSWORD and sys.stdin.isatty():
+        print("[client] Key auth failed; falling back to interactive password prompt (enabled)...")
+        proc2 = subprocess.run(
+            [
+                sftp,
+                "-P",
+                str(SERVER_PORT),
+                "-B",
+                str(SFTP_BUFFER_SIZE),
+                "-R",
+                str(SFTP_NUM_REQUESTS),
+                *opts,
+                "-o",
+                "BatchMode=no",
+                f"{USERNAME}@{SERVER_IP}",
+            ],
+            input=batch,
+            text=True,
+        )
         if proc2.returncode == 0:
             return
         raise SystemExit(proc2.returncode)
 
-    raise SystemExit(proc.returncode)
+    raise SystemExit(
+        "[client] Authentication failed.\n"
+        "Install the printed public key on the server (authorized_keys) to enable passwordless login.\n"
+        "Alternatively, install sshpass for non-interactive password auth, or set LORETT_ALLOW_INTERACTIVE_PASSWORD=1.\n"
+    )
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python3 MainClient.py <path_to_file>")
+        print("Usage: python3 MainClient.py <path_to_file>\n"
+              "       python3 MainClient.py --print-pubkey")
         raise SystemExit(2)
+
+    if sys.argv[1] == "--print-pubkey":
+        key_path = Path(os.environ.get("LORETT_SFTP_KEY", str(DEFAULT_KEY_PATH))).expanduser()
+        pub_path = ensure_keypair(key_path)
+        pubkey_text = pub_path.read_text(encoding="utf-8").strip()
+        print(pubkey_text)
+        return
 
     local_path = Path(sys.argv[1])
     if not local_path.is_file():
@@ -158,6 +194,7 @@ def main() -> None:
     # Ключ по умолчанию можно переопределить через LORETT_SFTP_KEY
     key_path = Path(os.environ.get("LORETT_SFTP_KEY", str(DEFAULT_KEY_PATH))).expanduser()
     pub_path = ensure_keypair(key_path)
+    pubkey_text = pub_path.read_text(encoding="utf-8").strip()
 
     remote_path = f"{REMOTE_DIR}/{local_path.name}"
 
@@ -167,6 +204,7 @@ def main() -> None:
     print("[client] Using OpenSSH sftp (internal-sftp on server)")
     print(f"[client] Identity key: {key_path}")
     print(f"[client] Public key to install on server: {pub_path}")
+    print(f"[client] Public key (copy/paste): {pubkey_text}")
     print(f"[client] Uploading: {local_path} -> {remote_path}")
 
     run_sftp_put(local_path, remote_path, key_path)
