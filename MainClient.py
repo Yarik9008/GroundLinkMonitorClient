@@ -16,8 +16,14 @@ PASSWORD = "sftppass123"
 REMOTE_DIR = "/"  # внутри chroot это uploads/
 
 # Тюнинг скорости SFTP
-BLOCK_SIZE = 256 * 1024   # 256KB блоки (часто быстрее дефолта)
-MAX_REQUESTS = 128        # параллельные запросы (увеличивает throughput)
+BLOCK_SIZE = 256 * 1024 * 1024  # 256MB блоки (часто быстрее дефолта)
+MAX_REQUESTS = 128 * 1024        # параллельные запросы (увеличивает throughput)
+
+# Safety caps: слишком большие значения могут резко увеличить RAM/overhead и даже замедлить передачу.
+MAX_BLOCK_SIZE = 4 * 1024 * 1024       # 4MB
+MAX_MAX_REQUESTS = 2048               # 2k
+EFFECTIVE_BLOCK_SIZE = min(BLOCK_SIZE, MAX_BLOCK_SIZE)
+EFFECTIVE_MAX_REQUESTS = min(MAX_REQUESTS, MAX_MAX_REQUESTS)
 
 # Тюнинг UI прогресса (частый print/flush может резать скорость)
 PROGRESS_MIN_INTERVAL_S = 2.0  # не чаще, чем раз в N секунд
@@ -101,9 +107,9 @@ async def main():
 
         # Быстрые шифры (порядок = приоритет)
         encryption_algs=[
-            "chacha20-poly1305@openssh.com",
             "aes128-gcm@openssh.com",
             "aes256-gcm@openssh.com",
+            "chacha20-poly1305@openssh.com",
             "aes128-ctr",
         ],
         # ==================================
@@ -114,8 +120,8 @@ async def main():
             await sftp.put(
                 str(local_path),
                 remote_path,
-                block_size=BLOCK_SIZE,
-                max_requests=MAX_REQUESTS,
+                block_size=EFFECTIVE_BLOCK_SIZE,
+                max_requests=EFFECTIVE_MAX_REQUESTS,
                 progress_handler=progress,
             )
 
