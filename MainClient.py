@@ -65,8 +65,8 @@ async def upload_file(local_path: str):
                     chunk_size = 32768  # 32KB chunks
                     bytes_sent = 0
                     
-                    async with await sftp.open(remote_path, 'wb') as remote_file:
-                        with open(local_file, 'rb') as local_file_obj:
+                    async with sftp.open(remote_path, 'wb') as remote_file:
+                        with open(str(local_file), 'rb') as local_file_obj:
                             while True:
                                 chunk = local_file_obj.read(chunk_size)
                                 if not chunk:
