@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
 import sys
-import time
 from pathlib import Path
 
 import asyncssh
@@ -62,34 +61,30 @@ class LorettSFTPClient:
                     unit_divisor=1024,
                     desc=f"Uploading {filename}",
                     ncols=80,
-                    mininterval=0.5,
+                    # Make UI updates cheap (Windows console is slow).
+                    # We also throttle in progress_handler by bytes.
+                    mininterval=1.0,
                     smoothing=0,
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                    disable=not sys.stderr.isatty(),
                 ) as pbar:
                     # Fast path: asyncssh optimized uploader
                     block_size = 4 * 1024 * 1024  # 4 MiB
-                    max_requests = 256
+                    # Too many in-flight requests can hurt throughput on some links/servers.
+                    # 128 is a good high-throughput default; tune if needed.
+                    max_requests = 128
 
-                    last_bytes = 0
-                    pending = 0
-                    last_update = time.monotonic()
-                    min_update_bytes = 8 * 1024 * 1024
+                    progress_step = 16 * 1024 * 1024  # update every 16 MiB
+                    last_reported = 0
 
                     def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
-                        nonlocal last_bytes, pending, last_update
-                        delta = max(0, bytes_copied - last_bytes)
-                        last_bytes = bytes_copied
-                        pending += delta
-
-                        now = time.monotonic()
-                        if pending and (
-                            pending >= min_update_bytes
-                            or now - last_update >= 0.5
-                            or bytes_copied >= total_bytes
-                        ):
-                            pbar.update(pending)
-                            pending = 0
-                            last_update = now
+                        nonlocal last_reported
+                        if bytes_copied < last_reported:
+                            return
+                        delta = bytes_copied - last_reported
+                        if delta >= progress_step or bytes_copied >= total_bytes:
+                            pbar.update(delta)
+                            last_reported = bytes_copied
 
                     await sftp.put(
                         str(local_file),
@@ -98,8 +93,9 @@ class LorettSFTPClient:
                         max_requests=max_requests,
                         progress_handler=progress_handler,
                     )
-                    if pending:
-                        pbar.update(pending)
+                    # Ensure bar ends at 100%
+                    if last_reported < file_size:
+                        pbar.update(file_size - last_reported)
 
                 print("[client] ✓ Upload complete!")
                 attrs = await sftp.stat(remote_path)
