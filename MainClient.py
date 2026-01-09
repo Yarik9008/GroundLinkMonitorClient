@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import math
+import socket
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,50 @@ ENCRYPTION_ALGS = [
     "aes128-ctr",
     "aes256-ctr",
 ]
+
+# SSH channel flow-control tuning.
+# Bigger window + packet size reduces per-packet overhead and improves throughput on high BDP links.
+# These values are negotiated; if peer can't support them, AsyncSSH will fall back.
+SSH_WINDOW = 1024 * 1024 * 1024     # 1 GiB
+SSH_MAX_PKTSIZE = 8 * 1024 * 1024   # 8 MiB
+
+# SFTP pipelining tuning.
+SFTP_BLOCK_SIZE = 16 * 1024 * 1024  # 16 MiB per request
+SFTP_MAX_REQUESTS = 4096            # aggressive pipelining
+
+# TCP socket tuning (best-effort). Requires using a pre-connected socket with asyncssh.connect(sock=...).
+USE_TUNED_SOCKET = True
+TCP_SNDBUF = 256 * 1024 * 1024      # 256 MiB
+TCP_RCVBUF = 256 * 1024 * 1024      # 256 MiB
+
+
+async def _create_tuned_connected_socket(host: str, port: int) -> socket.socket:
+    """Create a non-blocking TCP socket with aggressive buffer settings and connect it."""
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    family, socktype, proto, _canonname, sockaddr = infos[0]
+
+    sock = socket.socket(family=family, type=socktype, proto=proto)
+    try:
+        sock.setblocking(False)
+        # Best-effort: OS may cap values.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP_SNDBUF)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP_RCVBUF)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Optional Linux hints (ignore if unsupported)
+        if hasattr(socket, "TCP_QUICKACK"):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+            except OSError:
+                pass
+        await loop.sock_connect(sock, sockaddr)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
 
 
 def format_bytes(size):
@@ -70,15 +115,20 @@ class LorettSFTPClient:
         for attempt in range(1, max_attempts + 1):
             print(f"[client] Connecting to {self.host}:{self.port}... (attempt {attempt}/{max_attempts})")
             try:
+                sock = None
+                if USE_TUNED_SOCKET:
+                    sock = await _create_tuned_connected_socket(self.host, self.port)
+
                 async with asyncssh.connect(
-                    self.host,
-                    port=self.port,
+                    sock=sock,
                     username=self.username,
                     password=self.password,
                     known_hosts=None,  # demo / no host key verification
                     rekey_bytes=REKEY_BYTES,
                     compression_algs=COMPRESSION_ALGS,
                     encryption_algs=ENCRYPTION_ALGS,
+                    window=SSH_WINDOW,
+                    max_pktsize=SSH_MAX_PKTSIZE,
                     # Keepalives reduce chance of long-transfer timeouts
                     keepalive_interval=15,
                     keepalive_count_max=3,
@@ -96,8 +146,8 @@ class LorettSFTPClient:
                         print(f"[client] File: {filename} ({format_bytes(file_size)})")
 
                         # Fast path: asyncssh optimized uploader
-                        block_size = 4 * 1024 * 1024  # 4 MiB
-                        max_requests = 128
+                        block_size = SFTP_BLOCK_SIZE
+                        max_requests = SFTP_MAX_REQUESTS
 
                         # Built-in asyncssh progress_handler.
                         # We render a progress bar and update it strictly once per second.
@@ -137,6 +187,7 @@ class LorettSFTPClient:
                             remote_path,
                             block_size=block_size,
                             max_requests=max_requests,
+                            sparse=False,
                             progress_handler=progress_handler,
                         )
 
