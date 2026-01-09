@@ -20,7 +20,7 @@ BLOCK_SIZE = 256 * 1024   # 256KB блоки (часто быстрее дефо
 MAX_REQUESTS = 128        # параллельные запросы (увеличивает throughput)
 
 # Тюнинг UI прогресса (частый print/flush может резать скорость)
-PROGRESS_MIN_INTERVAL_S = 0.25  # не чаще, чем раз в N секунд
+PROGRESS_MIN_INTERVAL_S = 2.0  # не чаще, чем раз в N секунд
 PROGRESS_MIN_BYTES = 512 * 1024  # или при приросте >= N байт (512KB)
 
 
