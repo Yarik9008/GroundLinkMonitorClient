@@ -13,6 +13,20 @@ USERNAME = "sftpuser"
 PASSWORD = "sftppass123"
 # =========================================
 
+# Performance tuning (large files / high throughput)
+# Avoid frequent SSH rekey during multi-GB transfers.
+REKEY_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
+# Disable compression for max throughput (and CPU savings)
+COMPRESSION_ALGS = ["none"]
+# Prefer fast ciphers (hardware AES if available, otherwise ChaCha20)
+ENCRYPTION_ALGS = [
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+    "chacha20-poly1305@openssh.com",
+    "aes128-ctr",
+    "aes256-ctr",
+]
+
 
 def format_bytes(size):
     """Format bytes to human readable format."""
@@ -48,6 +62,9 @@ class LorettSFTPClient:
             username=self.username,
             password=self.password,
             known_hosts=None,  # demo / no host key verification
+            rekey_bytes=REKEY_BYTES,
+            compression_algs=COMPRESSION_ALGS,
+            encryption_algs=ENCRYPTION_ALGS,
         ) as conn:
             print("[client] Connected! Starting SFTP session...")
 
