@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-import asyncio
+import os
+import subprocess
 import sys
-import time
 from pathlib import Path
-
-import asyncssh
 
 # ====== Static config ======
 SERVER_IP = "130.49.146.15"
@@ -13,124 +11,130 @@ USERNAME = "sftpuser"
 PASSWORD = "sftppass123"
 # ===========================
 
-REMOTE_DIR = "/"  # внутри chroot это uploads/
+REMOTE_DIR = "/uploads"  # внутри chroot это uploads/
 
-# Тюнинг скорости SFTP
-BLOCK_SIZE = 256 * 1024 * 1024  # 256MB блоки (часто быстрее дефолта)
-MAX_REQUESTS = 128 * 1024        # параллельные запросы (увеличивает throughput)
+SFTP_BUFFER_SIZE = 4 * 1024 * 1024  # sftp -B (буфер I/O)
+SFTP_NUM_REQUESTS = 256             # sftp -R (кол-во параллельных запросов)
 
-# Safety caps: слишком большие значения могут резко увеличить RAM/overhead и даже замедлить передачу.
-MAX_BLOCK_SIZE = 4 * 1024 * 1024       # 4MB
-MAX_MAX_REQUESTS = 2048               # 2k
-EFFECTIVE_BLOCK_SIZE = min(BLOCK_SIZE, MAX_BLOCK_SIZE)
-EFFECTIVE_MAX_REQUESTS = min(MAX_REQUESTS, MAX_MAX_REQUESTS)
+# OpenSSH key (по умолчанию). Если ключа нет — сгенерируем.
+DEFAULT_KEY_PATH = Path.home() / ".ssh" / "lorett_sftp_ed25519"
 
-# Тюнинг UI прогресса (частый print/flush может резать скорость)
-PROGRESS_MIN_INTERVAL_S = 2.0  # не чаще, чем раз в N секунд
-PROGRESS_MIN_BYTES = 512 * 1024 * 1024  # или при приросте >= N байт (512MB)
+# Для простоты (в проде лучше хранить known_hosts)
+SFTP_STRICT_HOSTKEY = False
 
 
-def format_bytes(n: float) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    while n >= 1024 and i < len(units) - 1:
-        n /= 1024
-        i += 1
-    return f"{n:.2f}{units[i]}"
+def _which(cmd: str) -> str | None:
+    from shutil import which
+
+    return which(cmd)
 
 
-def make_progress_printer():
-    """
-    Простой прогресс-бар + текущая скорость + ETA.
-    Используется через progress_handler в asyncssh sftp.put()
-    """
-    now0 = time.monotonic()
-    state = {"t0": now0, "last_t": now0, "last_n": 0}
+def ensure_keypair(private_key_path: Path) -> Path:
+    private_key_path = private_key_path.expanduser()
+    public_key_path = private_key_path.with_suffix(private_key_path.suffix + ".pub")
 
-    def progress(srcpath, dstpath, transferred, total):
-        now = time.monotonic()
-        is_final = bool(total) and transferred >= total
+    if private_key_path.exists() and public_key_path.exists():
+        return public_key_path
 
-        # Throttle progress updates to reduce overhead on fast links.
-        dt_emit = now - state["last_t"]
-        dn_emit = transferred - state["last_n"]
-        if not is_final and dt_emit < PROGRESS_MIN_INTERVAL_S and dn_emit < PROGRESS_MIN_BYTES:
+    private_key_path.parent.mkdir(parents=True, exist_ok=True)
+    ssh_keygen = _which("ssh-keygen")
+    if not ssh_keygen:
+        raise SystemExit("ssh-keygen not found. Install OpenSSH client tools.")
+
+    cmd = [
+        ssh_keygen,
+        "-t",
+        "ed25519",
+        "-f",
+        str(private_key_path),
+        "-N",
+        "",
+        "-C",
+        "lorett-sftp",
+    ]
+    subprocess.run(cmd, check=True)
+    if not public_key_path.exists():
+        raise SystemExit(f"Failed to generate public key: {public_key_path}")
+    return public_key_path
+
+
+def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
+    sftp = _which("sftp")
+    if not sftp:
+        raise SystemExit("sftp not found. Install OpenSSH client tools.")
+
+    opts: list[str] = []
+    if not SFTP_STRICT_HOSTKEY:
+        opts += [
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+        ]
+
+    # В batch-файле обязательно кавычки, иначе пути с пробелами ломаются.
+    batch = f'put "{local_path}" "{remote_path}"\nquit\n'
+
+    base_cmd = [
+        sftp,
+        "-P",
+        str(SERVER_PORT),
+        "-i",
+        str(key_path),
+        "-B",
+        str(SFTP_BUFFER_SIZE),
+        "-R",
+        str(SFTP_NUM_REQUESTS),
+        *opts,
+        f"{USERNAME}@{SERVER_IP}",
+    ]
+
+    # 1) Быстрая попытка только по ключу (не зависнуть на вводе пароля).
+    proc = subprocess.run(base_cmd + ["-o", "BatchMode=yes"], input=batch, text=True)
+    if proc.returncode == 0:
+        return
+
+    # 2) Если ключ не установлен, но запуск интерактивный — дадим шанс ввести пароль.
+    if sys.stdin.isatty():
+        print("[client] Key auth failed; falling back to interactive password prompt...")
+        proc2 = subprocess.run(base_cmd + ["-o", "BatchMode=no"], input=batch, text=True)
+        if proc2.returncode == 0:
             return
+        raise SystemExit(proc2.returncode)
 
-        dt = max(now - state["last_t"], 1e-6)
-        dn = transferred - state["last_n"]
-        speed = dn / dt  # bytes/s
-
-        elapsed = now - state["t0"]
-        eta = (total - transferred) / speed if speed > 0 and total else 0.0
-
-        pct = (transferred / total * 100) if total else 0.0
-        bar_len = 30
-        filled = int(bar_len * pct / 100) if total else 0
-        bar = "#" * filled + "-" * (bar_len - filled)
-
-        line = (
-            f"\r[{bar}] {pct:6.2f}%  "
-            f"{format_bytes(transferred)}/{format_bytes(total)}  "
-            f"{format_bytes(speed)}/s  "
-            f"elapsed {elapsed:,.1f}s  eta {eta:,.1f}s"
-        )
-        print(line, end="", flush=True)
-
-        state["last_t"] = now
-        state["last_n"] = transferred
-
-    return progress
+    raise SystemExit(proc.returncode)
 
 
-async def main():
+def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_file>")
+        print("Usage: python3 MainClient.py <path_to_file>")
         raise SystemExit(2)
 
     local_path = Path(sys.argv[1])
     if not local_path.is_file():
         raise SystemExit(f"File not found: {local_path}")
 
-    progress = make_progress_printer()
+    # Ключ по умолчанию можно переопределить через LORETT_SFTP_KEY
+    key_path = Path(os.environ.get("LORETT_SFTP_KEY", str(DEFAULT_KEY_PATH))).expanduser()
+    pub_path = ensure_keypair(key_path)
 
-    async with asyncssh.connect(
-        SERVER_IP,
-        port=SERVER_PORT,
-        username=USERNAME,
-        password=PASSWORD,
-        known_hosts=None,  # для простоты (в проде лучше проверять host key)
+    remote_path = f"{REMOTE_DIR}/{local_path.name}"
 
-        # ======= SPEED / CPU tuning =======
-        # Компрессия полностью OFF
-        compression_algs=["none"],
+    if not key_path.exists():
+        raise SystemExit(f"Private key not found: {key_path}")
 
-        # Быстрые шифры (порядок = приоритет)
-        encryption_algs=[
-            "aes128-gcm@openssh.com",
-            "aes256-gcm@openssh.com",
-            "chacha20-poly1305@openssh.com",
-            "aes128-ctr",
-        ],
-        # ==================================
-    ) as conn:
-        async with conn.start_sftp_client() as sftp:
-            remote_path = f"{REMOTE_DIR}{local_path.name}"
+    print("[client] Using OpenSSH sftp (internal-sftp on server)")
+    print(f"[client] Identity key: {key_path}")
+    print(f"[client] Public key to install on server: {pub_path}")
+    print(f"[client] Uploading: {local_path} -> {remote_path}")
 
-            await sftp.put(
-                str(local_path),
-                remote_path,
-                block_size=EFFECTIVE_BLOCK_SIZE,
-                max_requests=EFFECTIVE_MAX_REQUESTS,
-                progress_handler=progress,
-            )
-
-    print(f"\n[client] Uploaded: {local_path} -> {remote_path}")
+    run_sftp_put(local_path, remote_path, key_path)
+    print(f"[client] Done: {local_path} -> {remote_path}")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except (OSError, asyncssh.Error) as e:
+        main()
+    except (OSError, subprocess.SubprocessError) as e:
         print(f"[client] ERROR: {e}")
         raise

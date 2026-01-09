@@ -1,1 +1,2 @@
-asyncssh>=2.22.0
+# No Python dependencies.
+# This client uses system OpenSSH tools: sftp/ssh-keygen.
