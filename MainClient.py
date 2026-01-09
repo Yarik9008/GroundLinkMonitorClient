@@ -77,6 +77,8 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
             "StrictHostKeyChecking=no",
             "-o",
             f"UserKnownHostsFile={_KNOWN_HOSTS_NULL}",
+            "-o",
+            "LogLevel=ERROR",
         ]
 
     # В batch-файле обязательно кавычки, иначе пути с пробелами ломаются.
