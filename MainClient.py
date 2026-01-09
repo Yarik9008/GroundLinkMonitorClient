@@ -127,7 +127,8 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
         return
 
     # 2) Полностью автоматическая парольная авторизация (если доступен sshpass).
-    password = os.environ.get("LORETT_SFTP_PASSWORD", PASSWORD)
+    # Пароль фиксирован в конфиге клиента (должен совпадать с MainServer.py).
+    password = PASSWORD
     if password and _which("sshpass"):
         print("[client] Key auth failed; trying non-interactive password auth (sshpass)...")
         proc_pw = subprocess.run(build_password_cmd(password), input=batch, text=True)
