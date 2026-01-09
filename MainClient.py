@@ -22,6 +22,9 @@ DEFAULT_KEY_PATH = Path.home() / ".ssh" / "lorett_sftp_ed25519"
 # Для простоты (в проде лучше хранить known_hosts)
 SFTP_STRICT_HOSTKEY = False
 
+# Куда писать known_hosts, чтобы не засорять профиль пользователя.
+_KNOWN_HOSTS_NULL = "NUL" if os.name == "nt" else "/dev/null"
+
 # По умолчанию НЕ спрашиваем пароль интерактивно (чтобы запуск был полностью автоматический).
 # Если нужно вернуть старое поведение, установите LORETT_ALLOW_INTERACTIVE_PASSWORD=1
 ALLOW_INTERACTIVE_PASSWORD = os.environ.get("LORETT_ALLOW_INTERACTIVE_PASSWORD", "0") == "1"
@@ -73,7 +76,7 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
-            f"UserKnownHostsFile={os.devnull}",
+            f"UserKnownHostsFile={_KNOWN_HOSTS_NULL}",
         ]
 
     # В batch-файле обязательно кавычки, иначе пути с пробелами ломаются.
