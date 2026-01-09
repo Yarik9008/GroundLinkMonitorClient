@@ -2,6 +2,7 @@
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 import asyncssh
@@ -58,23 +59,44 @@ async def upload_file(local_path: str):
                     unit_divisor=1024,
                     desc=f"Uploading {filename}",
                     ncols=80,
+                    # tqdm updates can throttle throughput if too frequent
+                    mininterval=0.5,
+                    smoothing=0,
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
                 ) as pbar:
-                    
-                    # Upload file in chunks with progress tracking
-                    chunk_size = 32768  # 32KB chunks
-                    bytes_sent = 0
-                    
-                    async with sftp.open(remote_path, 'wb') as remote_file:
-                        with open(str(local_file), 'rb') as local_file_obj:
-                            while True:
-                                chunk = local_file_obj.read(chunk_size)
-                                if not chunk:
-                                    break
-                                await remote_file.write(chunk)
-                                bytes_sent += len(chunk)
-                                pbar.n = bytes_sent
-                                pbar.refresh()
+                    # Use asyncssh's optimized uploader.
+                    # Tune for throughput: bigger blocks + more in-flight requests.
+                    block_size = 4 * 1024 * 1024  # 4 MiB
+                    max_requests = 256            # number of concurrent SFTP requests
+
+                    last_bytes = 0
+                    pending = 0
+                    last_update = time.monotonic()
+                    min_update_bytes = 8 * 1024 * 1024  # 8 MiB
+
+                    def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
+                        nonlocal last_bytes, pending, last_update
+                        # Throttle tqdm updates to avoid slowing down transfers
+                        delta = max(0, bytes_copied - last_bytes)
+                        last_bytes = bytes_copied
+                        pending += delta
+
+                        now = time.monotonic()
+                        if pending and (pending >= min_update_bytes or now - last_update >= 0.5 or bytes_copied >= total_bytes):
+                            pbar.update(pending)
+                            pending = 0
+                            last_update = now
+
+                    await sftp.put(
+                        str(local_file),
+                        remote_path,
+                        block_size=block_size,
+                        max_requests=max_requests,
+                        progress_handler=progress_handler,
+                    )
+                    # Flush any remaining progress
+                    if pending:
+                        pbar.update(pending)
                 
                 print(f"[client] ✓ Upload complete!")
                 
