@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Клиент для отправки изображений на сервер
+Клиент для отправки изображений/файлов на сервер через SFTP (SSH).
+
+Поведение (совместимо с прежней логикой `.part/.done`):
+- Загружаем в:   <client_name>/<upload_id>_<filename>.part
+- Если `.part` уже есть — докачиваем (resume) с текущего размера
+- После завершения:
+  - переименовываем `.part` в `<timestamp>_<filename>`
+  - пишем маркер `<upload_id>.done` с именем финального файла
 """
 from dataclasses import dataclass
-import struct
 import sys
 import os
 import asyncio
-import socket
 import hashlib
-from typing import Optional, Tuple
+from datetime import datetime
+from typing import Optional
 from Logger import Logger
 try:
     from tqdm import tqdm
@@ -22,97 +28,41 @@ except ImportError:
 # имя клиента по умолчанию
 CLIENT_NAME = "R2.0S"
 
+
+try:
+    import paramiko
+except ImportError as e:  # pragma: no cover
+    raise SystemExit(
+        "Не найдено 'paramiko'. Установите зависимости:\n"
+        "  pip install -r GroundLinkMonitorClient/requirements.txt\n"
+    ) from e
+
+
 @dataclass(frozen=True)
 class ClientConfig:
     server_ip: str = "130.49.146.15"
-    server_port: int = 8888
+    server_port: int = 8888  # SSH/SFTP port
+    username: str = "lorett"
+    password: str = "lorett"
     client_name: str = "default_client"
     log_level: str = "info"
 
     # Производительность
     chunk_size: int = 4 * 1024 * 1024  # 4 MB
-    stream_limit: int = 8 * 1024 * 1024
     file_buffering: int = 4 * 1024 * 1024
-
-    # Буферизация записи: не вызываем drain на каждый чанк
-    write_buffer_high: int = 32 * 1024 * 1024
-    write_buffer_low: int = 8 * 1024 * 1024
-
-    # Таймауты (секунды)
     connect_timeout: float = 10.0
-    response_timeout: float = 30.0
-    offset_timeout: float = 120.0
-    drain_timeout: float = 30.0
 
     # Повторы при разрыве связи
     max_retries: int = 0  # 0 = бесконечно
     retry_delay_sec: float = 2.0
 
 
-class ProtocolV2:
-    @staticmethod
-    def pack_string(value: str) -> bytes:
-        b = value.encode("utf-8")
-        return struct.pack("!I", len(b)) + b
-
-    @staticmethod
-    def pack_u64(value: int) -> bytes:
-        return struct.pack("!Q", int(value))
-
-    @staticmethod
-    async def read_u64(reader: asyncio.StreamReader) -> int:
-        data = await reader.readexactly(8)
-        return struct.unpack("!Q", data)[0]
-
-    @staticmethod
-    def build_header(client_name: str, filename: str, file_size: int, upload_id: str) -> bytes:
-        # client_name(str) + file_size(u64) + filename(str) + upload_id(str)
-        return (
-            ProtocolV2.pack_string(client_name)
-            + ProtocolV2.pack_u64(file_size)
-            + ProtocolV2.pack_string(filename)
-            + ProtocolV2.pack_string(upload_id)
-        )
-
-
-class AsyncConnection:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self.reader = reader
-        self.writer = writer
-        self.transport = getattr(writer, "transport", None)
-
-    def tune_socket(self, recv_buf: int = 4 * 1024 * 1024, send_buf: int = 4 * 1024 * 1024) -> None:
-        sock = self.writer.get_extra_info("socket")
-        if isinstance(sock, socket.socket):
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buf)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buf)
-            except Exception:
-                pass
-
-    def set_write_buffer_limits(self, high: int, low: int) -> None:
-        if self.transport is None:
-            return
-        try:
-            self.transport.set_write_buffer_limits(high=high, low=low)
-        except Exception:
-            pass
-
-    async def close(self) -> None:
-        try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except Exception:
-            pass
-
-
-class ResumableUploader:
+class SFTPUploader:
     def __init__(self, config: ClientConfig, logger: Logger):
         self.config = config
         self.logger = logger
-        self._conn: Optional[AsyncConnection] = None
+        self._transport: Optional["paramiko.Transport"] = None
+        self._sftp: Optional["paramiko.SFTPClient"] = None
 
     @staticmethod
     def compute_upload_id(client_name: str, filename: str, file_size: int, path: str) -> str:
@@ -121,147 +71,160 @@ class ResumableUploader:
         seed = f"{client_name}|{filename}|{file_size}|{mtime_ns}".encode("utf-8")
         return hashlib.sha256(seed).hexdigest()
 
-    async def connect(self) -> bool:
+    @staticmethod
+    def safe_filename(name: str) -> str:
+        base = os.path.basename(name)
+        return base.replace("/", "_").replace("\\", "_")
+
+    def _connect_blocking(self) -> bool:
         try:
-            self.logger.info(f"Подключение к серверу {self.config.server_ip}:{self.config.server_port}...")
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    self.config.server_ip,
-                    self.config.server_port,
-                    limit=max(self.config.stream_limit, self.config.chunk_size * 2),
-                ),
-                timeout=self.config.connect_timeout,
-            )
-            conn = AsyncConnection(reader, writer)
-            conn.tune_socket()
-            conn.set_write_buffer_limits(high=self.config.write_buffer_high, low=self.config.write_buffer_low)
-            self._conn = conn
-            self.logger.info("Подключение установлено")
+            self.logger.info(f"SFTP подключение к {self.config.server_ip}:{self.config.server_port}...")
+            transport = paramiko.Transport((self.config.server_ip, self.config.server_port))
+            transport.banner_timeout = self.config.connect_timeout
+            transport.auth_timeout = self.config.connect_timeout
+            transport.connect(username=self.config.username, password=self.config.password)
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            self._transport = transport
+            self._sftp = sftp
+            self.logger.info("SFTP подключение установлено")
             return True
-        except asyncio.TimeoutError:
-            self.logger.error(f"Таймаут при подключении к серверу {self.config.server_ip}:{self.config.server_port}")
-            return False
-        except ConnectionRefusedError:
-            self.logger.error(f"Не удалось подключиться к серверу {self.config.server_ip}:{self.config.server_port}")
-            self.logger.warning("Убедитесь, что сервер запущен")
-            return False
         except Exception as e:
-            self.logger.error(f"Ошибка при подключении: {e}")
+            self.logger.error(f"Ошибка SFTP подключения: {e}")
             return False
+
+    async def connect(self) -> bool:
+        return await asyncio.to_thread(self._connect_blocking)
 
     async def disconnect(self) -> None:
-        if self._conn:
-            await self._conn.close()
-            self._conn = None
-            self.logger.debug("Соединение закрыто")
+        sftp = self._sftp
+        transport = self._transport
+        self._sftp = None
+        self._transport = None
+        try:
+            if sftp is not None:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if transport is not None:
+                transport.close()
+        except Exception:
+            pass
 
-    async def _drain_if_needed(self) -> None:
-        if not self._conn:
-            raise ConnectionError("Нет подключения к серверу")
-        await asyncio.wait_for(self._conn.writer.drain(), timeout=self.config.drain_timeout)
+    def _ensure_remote_dir(self, remote_dir: str) -> None:
+        assert self._sftp is not None
+        # Создаём цепочку директорий (POSIX-пути)
+        parts = [p for p in remote_dir.strip("/").split("/") if p]
+        cur = ""
+        for p in parts:
+            cur = f"{cur}/{p}" if cur else p
+            try:
+                self._sftp.stat(cur)
+            except IOError:
+                self._sftp.mkdir(cur)
 
-    async def _send_file_region(self, file_obj, size: int, show_progress: bool, desc: str) -> int:
-        if not self._conn:
-            raise ConnectionError("Нет подключения к серверу")
-        conn = self._conn
-        sent_total = 0
-
-        def wrote(chunk: bytes) -> None:
-            if conn.transport is not None:
-                conn.transport.write(chunk)
-            else:
-                conn.writer.write(chunk)
-
-        async def maybe_drain() -> None:
-            if conn.transport is not None and conn.transport.get_write_buffer_size() <= self.config.write_buffer_high:
-                return
-            await self._drain_if_needed()
-
-        if show_progress and TQDM_AVAILABLE:
-            bar_format = "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
-            with tqdm(total=size, unit="B", unit_scale=True, unit_divisor=1024, desc=desc, ncols=100, bar_format=bar_format) as pbar:
-                while sent_total < size:
-                    chunk = file_obj.read(min(self.config.chunk_size, size - sent_total))
-                    if not chunk:
-                        break
-                    wrote(chunk)
-                    await maybe_drain()
-                    sent_total += len(chunk)
-                    pbar.update(len(chunk))
-        else:
-            while sent_total < size:
-                chunk = file_obj.read(min(self.config.chunk_size, size - sent_total))
-                if not chunk:
-                    break
-                wrote(chunk)
-                await maybe_drain()
-                sent_total += len(chunk)
-
-        await self._drain_if_needed()
-        return sent_total
-
-    async def upload(self, path: str) -> bool:
+    def _upload_blocking(self, path: str) -> bool:
         if not os.path.exists(path):
             self.logger.error(f"Файл {path} не найден")
             return False
 
-        filename = os.path.basename(path)
+        if self._sftp is None or self._transport is None:
+            if not self._connect_blocking():
+                return False
+        assert self._sftp is not None
+
+        filename = self.safe_filename(os.path.basename(path))
         file_size = os.path.getsize(path)
         upload_id = self.compute_upload_id(self.config.client_name, filename, file_size, path)
 
+        remote_dir = self.config.client_name
+        remote_part = f"{remote_dir}/{upload_id}_{filename}.part"
+
+        self._ensure_remote_dir(remote_dir)
+
+        # Resume: докачиваем в существующий .part
+        try:
+            offset = int(self._sftp.stat(remote_part).st_size)
+        except IOError:
+            offset = 0
+
+        if offset > file_size:
+            # странный случай: удаляем и начинаем заново
+            try:
+                self._sftp.remove(remote_part)
+            except Exception:
+                pass
+            offset = 0
+
+        remaining = file_size - offset
+        self.logger.info(
+            f"Загрузка SFTP: {filename} ({file_size} байт), upload_id={upload_id}, offset={offset}, осталось={remaining}"
+        )
+
+        mode = "ab" if offset > 0 else "wb"
+        with open(path, "rb", buffering=self.config.file_buffering) as lf:
+            lf.seek(offset)
+            with self._sftp.open(remote_part, mode) as rf:
+                sent = 0
+                if remaining > 0 and TQDM_AVAILABLE:
+                    bar_format = "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                    with tqdm(
+                        total=remaining,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=f"Отправка {filename} (resume {offset})" if offset else f"Отправка {filename}",
+                        ncols=100,
+                        bar_format=bar_format,
+                    ) as pbar:
+                        while sent < remaining:
+                            chunk = lf.read(min(self.config.chunk_size, remaining - sent))
+                            if not chunk:
+                                break
+                            rf.write(chunk)
+                            sent += len(chunk)
+                            pbar.update(len(chunk))
+                else:
+                    while sent < remaining:
+                        chunk = lf.read(min(self.config.chunk_size, remaining - sent))
+                        if not chunk:
+                            break
+                        rf.write(chunk)
+                        sent += len(chunk)
+
+        # Проверка размера на сервере
+        try:
+            final_remote_size = int(self._sftp.stat(remote_part).st_size)
+        except Exception as e:
+            self.logger.error(f"Не удалось проверить размер remote файла: {e}")
+            return False
+
+        if final_remote_size != file_size:
+            self.logger.error(f"Размер remote файла не совпал: remote={final_remote_size}, local={file_size}")
+            return False
+
+        # Финализация (rename + done marker)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_name = f"{timestamp}_{filename}"
+        remote_final = f"{remote_dir}/{final_name}"
+        remote_done = f"{remote_dir}/{upload_id}.done"
+
+        self._sftp.rename(remote_part, remote_final)
+        with self._sftp.open(remote_done, "wb") as df:
+            df.write((final_name + "\n").encode("utf-8"))
+
+        self.logger.info(f"Файл отправлен и финализирован: {remote_final}")
+        return True
+
+    async def upload(self, path: str) -> bool:
         attempt = 0
         while True:
             try:
-                if not self._conn:
-                    if not await self.connect():
-                        return False
-
-                assert self._conn is not None
-                conn = self._conn
-
-                self.logger.info(f"Загрузка: {filename} ({file_size} байт), upload_id={upload_id}, попытка={attempt+1}")
-
-                conn.writer.write(ProtocolV2.build_header(self.config.client_name, filename, file_size, upload_id))
-                await conn.writer.drain()
-
-                try:
-                    offset = await asyncio.wait_for(ProtocolV2.read_u64(conn.reader), timeout=self.config.offset_timeout)
-                except asyncio.TimeoutError as e:
-                    raise ConnectionError(f"Таймаут ожидания offset от сервера ({self.config.offset_timeout}s)") from e
-
-                if offset > file_size:
-                    raise ConnectionError(f"Сервер вернул некорректный offset={offset} > size={file_size}")
-
-                remaining = file_size - offset
-                if remaining > 0:
-                    self.logger.info(f"Продолжаю с offset={offset}, осталось отправить {remaining} байт")
-                    with open(path, "rb", buffering=self.config.file_buffering) as f:
-                        f.seek(offset)
-                        sent = await self._send_file_region(
-                            f, remaining, show_progress=True, desc=f"Отправка {filename} (resume {offset})"
-                        )
-                    if sent != remaining:
-                        raise ConnectionError(f"Отправлено {sent}/{remaining} байт (ожидалось {remaining})")
-                else:
-                    self.logger.info("Сервер сообщает: файл уже полностью загружен, жду подтверждение")
-
-                try:
-                    response = await asyncio.wait_for(conn.reader.readexactly(2), timeout=self.config.response_timeout)
-                except asyncio.TimeoutError as e:
-                    raise ConnectionError(f"Таймаут ожидания ответа OK/ER ({self.config.response_timeout}s)") from e
-
-                if response == b"OK":
-                    self.logger.info("Сервер подтвердил получение файла")
-                    return True
-                if response == b"ER":
-                    self.logger.error("Сервер вернул ошибку")
-                    return False
-                self.logger.warning(f"Неожиданный ответ от сервера: {response!r}")
-                return False
-
-            except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError, ConnectionError, asyncio.TimeoutError) as e:
+                ok = await asyncio.to_thread(self._upload_blocking, path)
+                return ok
+            except Exception as e:
                 attempt += 1
-                self.logger.warning(f"Разрыв/ошибка передачи: {type(e).__name__}: {e}. Переподключаюсь и продолжу...")
+                self.logger.warning(f"Разрыв/ошибка SFTP: {type(e).__name__}: {e}. Переподключаюсь и продолжу...")
                 await self.disconnect()
                 if self.config.max_retries and attempt >= self.config.max_retries:
                     self.logger.error("Достигнут лимит попыток, загрузка не завершена")
@@ -272,7 +235,15 @@ class ResumableUploader:
 class ImageClient:
     """Класс клиента для отправки изображений на сервер"""
     
-    def __init__(self, server_ip="130.49.146.15", server_port=8888, client_name="default_client", log_level="info"):
+    def __init__(
+        self,
+        server_ip="130.49.146.15",
+        server_port=8888,
+        username="lorett",
+        password="lorett",
+        client_name="default_client",
+        log_level="info",
+    ):
         # Создаем директорию для логов
         logs_dir = "/root/lorett/GroundLinkMonitorClient/logs"
         os.makedirs(logs_dir, exist_ok=True)
@@ -286,10 +257,12 @@ class ImageClient:
         self.config = ClientConfig(
             server_ip=server_ip,
             server_port=server_port,
+            username=username,
+            password=password,
             client_name=client_name,
             log_level=log_level,
         )
-        self._uploader = ResumableUploader(self.config, self.logger)
+        self._uploader = SFTPUploader(self.config, self.logger)
     
     async def send_image(self, image_path):
         return await self._uploader.upload(image_path)
