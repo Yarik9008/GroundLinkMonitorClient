@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import asyncio
+import math
 import sys
+import time
 from pathlib import Path
 
 import asyncssh
-from tqdm import tqdm
 
 # ====== Static config (as requested) ======
 SERVER_IP = "130.49.146.15"
@@ -94,65 +95,54 @@ class LorettSFTPClient:
 
                         print(f"[client] File: {filename} ({format_bytes(file_size)})")
 
-                        with tqdm(
-                            total=file_size,
-                            unit="B",
-                            unit_scale=True,
-                            unit_divisor=1024,
-                            desc=f"Uploading {filename}",
-                            ncols=80,
-                            # Make UI updates cheap (Windows console is slow).
-                            mininterval=1.0,
-                            smoothing=0,
-                            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                            disable=not sys.stderr.isatty(),
-                        ) as pbar:
-                            block_size = 4 * 1024 * 1024  # 4 MiB
-                            max_requests = 128
+                        # Fast path: asyncssh optimized uploader
+                        block_size = 4 * 1024 * 1024  # 4 MiB
+                        max_requests = 128
 
-                            # Progress updates: strictly once per second.
-                            # progress_handler only records latest byte count (cheap).
-                            last_reported = 0
-                            latest_bytes = 0
-                            stop_progress = asyncio.Event()
+                        # Built-in asyncssh progress_handler.
+                        # We render a progress bar and update it strictly once per second.
+                        is_tty = sys.stderr.isatty()
+                        bar_width = 30
+                        start_ts = time.monotonic()
+                        last_print_ts = start_ts
 
-                            def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
-                                nonlocal latest_bytes
-                                # asyncssh may call this very often; keep it O(1)
-                                if bytes_copied > latest_bytes:
-                                    latest_bytes = bytes_copied
+                        def _render(bytes_copied: int, total_bytes: int) -> str:
+                            total = max(1, total_bytes)
+                            pct = min(100.0, (bytes_copied / total) * 100.0)
+                            filled = int((pct / 100.0) * bar_width)
+                            bar = "#" * filled + "-" * (bar_width - filled)
+                            elapsed = max(0.001, time.monotonic() - start_ts)
+                            rate = bytes_copied / elapsed
+                            eta = (total - bytes_copied) / rate if rate > 0 else math.inf
+                            eta_str = "?" if not math.isfinite(eta) else f"{int(eta)}s"
+                            return (
+                                f"\rUploading {filename} [{bar}] {pct:6.2f}% "
+                                f"{format_bytes(bytes_copied)}/{format_bytes(total_bytes)} "
+                                f"{format_bytes(rate)}/s ETA {eta_str}"
+                            )
 
-                            async def progress_ticker() -> None:
-                                nonlocal last_reported
-                                while not stop_progress.is_set():
-                                    await asyncio.sleep(1.0)
-                                    delta = latest_bytes - last_reported
-                                    if delta > 0:
-                                        pbar.update(delta)
-                                        last_reported = latest_bytes
+                        def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
+                            nonlocal last_print_ts
+                            if not is_tty:
+                                return
+                            now = time.monotonic()
+                            # strictly once per second, plus final update
+                            if bytes_copied >= total_bytes or now - last_print_ts >= 1.0:
+                                last_print_ts = now
+                                sys.stderr.write(_render(bytes_copied, total_bytes))
+                                sys.stderr.flush()
 
-                            ticker_task = asyncio.create_task(progress_ticker())
+                        await sftp.put(
+                            str(local_file),
+                            remote_path,
+                            block_size=block_size,
+                            max_requests=max_requests,
+                            progress_handler=progress_handler,
+                        )
 
-                            try:
-                                await sftp.put(
-                                    str(local_file),
-                                    remote_path,
-                                    block_size=block_size,
-                                    max_requests=max_requests,
-                                    progress_handler=progress_handler,
-                                )
-                            finally:
-                                stop_progress.set()
-                                ticker_task.cancel()
-                                try:
-                                    await ticker_task
-                                except asyncio.CancelledError:
-                                    pass
-
-                            # Finalize bar to 100% (in case we finished between ticks)
-                            final_delta = file_size - last_reported
-                            if final_delta > 0:
-                                pbar.update(final_delta)
+                        if is_tty:
+                            sys.stderr.write(_render(file_size, file_size) + "\n")
+                            sys.stderr.flush()
 
                         print("[client] ✓ Upload complete!")
                         attrs = await sftp.stat(remote_path)
