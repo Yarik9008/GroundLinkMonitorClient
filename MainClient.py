@@ -61,14 +61,20 @@ async def upload_file(local_path: str):
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
                 ) as pbar:
                     
-                    # Progress handler callback
-                    def progress_handler(src, dst, bytes_copied, total_bytes):
-                        # Update progress bar
-                        pbar.n = bytes_copied
-                        pbar.refresh()
+                    # Upload file in chunks with progress tracking
+                    chunk_size = 32768  # 32KB chunks
+                    bytes_sent = 0
                     
-                    # Upload file with progress handler
-                    await sftp.put(str(local_file), remote_path, progress_handler=progress_handler)
+                    async with await sftp.open(remote_path, 'wb') as remote_file:
+                        with open(local_file, 'rb') as local_file_obj:
+                            while True:
+                                chunk = local_file_obj.read(chunk_size)
+                                if not chunk:
+                                    break
+                                await remote_file.write(chunk)
+                                bytes_sent += len(chunk)
+                                pbar.n = bytes_sent
+                                pbar.refresh()
                 
                 print(f"[client] ✓ Upload complete!")
                 
