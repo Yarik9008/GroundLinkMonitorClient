@@ -94,12 +94,47 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
             f"{USERNAME}@{SERVER_IP}",
         ]
 
+    def build_password_cmd(password: str) -> list[str]:
+        sshpass = _which("sshpass")
+        if not sshpass:
+            raise SystemExit("[client] sshpass not found (can't do non-interactive password auth).")
+
+        # Force password auth path to avoid long key negotiation attempts.
+        return [
+            sshpass,
+            "-p",
+            password,
+            sftp,
+            "-P",
+            str(SERVER_PORT),
+            "-B",
+            str(SFTP_BUFFER_SIZE),
+            "-R",
+            str(SFTP_NUM_REQUESTS),
+            *opts,
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "PreferredAuthentications=password",
+            "-o",
+            "PubkeyAuthentication=no",
+            f"{USERNAME}@{SERVER_IP}",
+        ]
+
     # 1) Быстрая попытка только по ключу (не зависнуть на вводе пароля).
     proc = subprocess.run(build_cmd(batch_mode=True), input=batch, text=True)
     if proc.returncode == 0:
         return
 
-    # 2) Если ключ не установлен, но запуск интерактивный — дадим шанс ввести пароль.
+    # 2) Полностью автоматическая парольная авторизация (если доступен sshpass).
+    password = os.environ.get("LORETT_SFTP_PASSWORD", PASSWORD)
+    if password and _which("sshpass"):
+        print("[client] Key auth failed; trying non-interactive password auth (sshpass)...")
+        proc_pw = subprocess.run(build_password_cmd(password), input=batch, text=True)
+        if proc_pw.returncode == 0:
+            return
+
+    # 3) Если ключ не установлен, но запуск интерактивный — дадим шанс ввести пароль.
     if sys.stdin.isatty():
         print("[client] Key auth failed; falling back to interactive password prompt...")
         proc2 = subprocess.run(build_cmd(batch_mode=False), input=batch, text=True)
