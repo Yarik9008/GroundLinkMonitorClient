@@ -110,27 +110,49 @@ class LorettSFTPClient:
                             block_size = 4 * 1024 * 1024  # 4 MiB
                             max_requests = 128
 
-                            progress_step = 16 * 1024 * 1024  # update every 16 MiB
+                            # Progress updates: strictly once per second.
+                            # progress_handler only records latest byte count (cheap).
                             last_reported = 0
+                            latest_bytes = 0
+                            stop_progress = asyncio.Event()
 
                             def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
-                                nonlocal last_reported
-                                if bytes_copied < last_reported:
-                                    return
-                                delta = bytes_copied - last_reported
-                                if delta >= progress_step or bytes_copied >= total_bytes:
-                                    pbar.update(delta)
-                                    last_reported = bytes_copied
+                                nonlocal latest_bytes
+                                # asyncssh may call this very often; keep it O(1)
+                                if bytes_copied > latest_bytes:
+                                    latest_bytes = bytes_copied
 
-                            await sftp.put(
-                                str(local_file),
-                                remote_path,
-                                block_size=block_size,
-                                max_requests=max_requests,
-                                progress_handler=progress_handler,
-                            )
-                            if last_reported < file_size:
-                                pbar.update(file_size - last_reported)
+                            async def progress_ticker() -> None:
+                                nonlocal last_reported
+                                while not stop_progress.is_set():
+                                    await asyncio.sleep(1.0)
+                                    delta = latest_bytes - last_reported
+                                    if delta > 0:
+                                        pbar.update(delta)
+                                        last_reported = latest_bytes
+
+                            ticker_task = asyncio.create_task(progress_ticker())
+
+                            try:
+                                await sftp.put(
+                                    str(local_file),
+                                    remote_path,
+                                    block_size=block_size,
+                                    max_requests=max_requests,
+                                    progress_handler=progress_handler,
+                                )
+                            finally:
+                                stop_progress.set()
+                                ticker_task.cancel()
+                                try:
+                                    await ticker_task
+                                except asyncio.CancelledError:
+                                    pass
+
+                            # Finalize bar to 100% (in case we finished between ticks)
+                            final_delta = file_size - last_reported
+                            if final_delta > 0:
+                                pbar.update(final_delta)
 
                         print("[client] ✓ Upload complete!")
                         attrs = await sftp.stat(remote_path)
