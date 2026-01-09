@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import sys
-import posixpath
-import paramiko
+from pathlib import Path
+
+import asyncssh
 
 # ====== Static config (as requested) ======
 SERVER_IP = "130.49.146.15"
@@ -12,32 +14,64 @@ PASSWORD = "sftppass123"
 # =========================================
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python sftp_client.py <path_to_file>")
+async def upload_file(local_path: str):
+    """Upload a file to the SFTP server."""
+    local_file = Path(local_path)
+    if not local_file.is_file():
+        print(f"[client] Error: File not found: {local_path}")
         sys.exit(2)
-
-    local_path = sys.argv[1]
-    if not os.path.isfile(local_path):
-        print(f"File not found: {local_path}")
-        sys.exit(2)
-
-    filename = os.path.basename(local_path)
-    remote_path = posixpath.join("/", filename)  # upload into server root (uploads folder on server)
-
-    transport = paramiko.Transport((SERVER_IP, SERVER_PORT))
+    
+    filename = local_file.name
+    remote_path = f"/{filename}"
+    
+    print(f"[client] Connecting to {SERVER_IP}:{SERVER_PORT}...")
+    
     try:
-        transport.connect(username=USERNAME, password=PASSWORD)
-        sftp = paramiko.SFTPClient.from_transport(transport)
+        async with asyncssh.connect(
+            SERVER_IP,
+            port=SERVER_PORT,
+            username=USERNAME,
+            password=PASSWORD,
+            known_hosts=None,  # Skip host key verification (for demo)
+        ) as conn:
+            print(f"[client] Connected! Starting SFTP session...")
+            
+            async with conn.start_sftp_client() as sftp:
+                print(f"[client] Uploading {local_path} -> {remote_path}")
+                
+                # Upload file
+                await sftp.put(str(local_file), remote_path)
+                
+                print(f"[client] Upload complete!")
+                
+                # Verify file was uploaded
+                attrs = await sftp.stat(remote_path)
+                print(f"[client] Remote file size: {attrs.size} bytes")
+                
+    except asyncssh.PermissionDenied:
+        print("[client] Error: Permission denied (check username/password)")
+        sys.exit(1)
+    except asyncssh.Error as e:
+        print(f"[client] SSH Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[client] Unexpected error: {e}")
+        sys.exit(1)
 
-        print(f"[client] Uploading {local_path} -> {remote_path} on {SERVER_IP}:{SERVER_PORT}")
-        sftp.put(local_path, remote_path)
 
-        print("[client] Done.")
-        sftp.close()
-    finally:
-        transport.close()
+async def main():
+    """Main client function."""
+    if len(sys.argv) < 2:
+        print("Usage: python MainClient.py <path_to_file>")
+        sys.exit(2)
+    
+    local_path = sys.argv[1]
+    await upload_file(local_path)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[client] Interrupted by user")
+        sys.exit(130)

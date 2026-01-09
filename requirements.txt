@@ -1,2 +1,2 @@
 tqdm>=4.65.0
-paramiko>=3.5.0
+asyncssh>=2.22.0
