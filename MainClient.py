@@ -19,6 +19,10 @@ REMOTE_DIR = "/"  # внутри chroot это uploads/
 BLOCK_SIZE = 256 * 1024   # 256KB блоки (часто быстрее дефолта)
 MAX_REQUESTS = 128        # параллельные запросы (увеличивает throughput)
 
+# Тюнинг UI прогресса (частый print/flush может резать скорость)
+PROGRESS_MIN_INTERVAL_S = 0.25  # не чаще, чем раз в N секунд
+PROGRESS_MIN_BYTES = 512 * 1024  # или при приросте >= N байт (512KB)
+
 
 def format_bytes(n: float) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -34,10 +38,19 @@ def make_progress_printer():
     Простой прогресс-бар + текущая скорость + ETA.
     Используется через progress_handler в asyncssh sftp.put()
     """
-    state = {"t0": time.monotonic(), "last_t": time.monotonic(), "last_n": 0}
+    now0 = time.monotonic()
+    state = {"t0": now0, "last_t": now0, "last_n": 0}
 
     def progress(srcpath, dstpath, transferred, total):
         now = time.monotonic()
+        is_final = bool(total) and transferred >= total
+
+        # Throttle progress updates to reduce overhead on fast links.
+        dt_emit = now - state["last_t"]
+        dn_emit = transferred - state["last_n"]
+        if not is_final and dt_emit < PROGRESS_MIN_INTERVAL_S and dn_emit < PROGRESS_MIN_BYTES:
+            return
+
         dt = max(now - state["last_t"], 1e-6)
         dn = transferred - state["last_n"]
         speed = dn / dt  # bytes/s
