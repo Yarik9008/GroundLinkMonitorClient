@@ -69,35 +69,40 @@ def run_sftp_put(local_path: Path, remote_path: str, key_path: Path) -> None:
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
-            "UserKnownHostsFile=/dev/null",
+            f"UserKnownHostsFile={os.devnull}",
         ]
 
     # В batch-файле обязательно кавычки, иначе пути с пробелами ломаются.
     batch = f'put "{local_path}" "{remote_path}"\nquit\n'
 
-    base_cmd = [
-        sftp,
-        "-P",
-        str(SERVER_PORT),
-        "-i",
-        str(key_path),
-        "-B",
-        str(SFTP_BUFFER_SIZE),
-        "-R",
-        str(SFTP_NUM_REQUESTS),
-        *opts,
-        f"{USERNAME}@{SERVER_IP}",
-    ]
+    def build_cmd(batch_mode: bool) -> list[str]:
+        # IMPORTANT: all -o options must appear BEFORE destination, otherwise sftp prints usage and exits.
+        bm = "yes" if batch_mode else "no"
+        return [
+            sftp,
+            "-P",
+            str(SERVER_PORT),
+            "-i",
+            str(key_path),
+            "-B",
+            str(SFTP_BUFFER_SIZE),
+            "-R",
+            str(SFTP_NUM_REQUESTS),
+            *opts,
+            "-o",
+            f"BatchMode={bm}",
+            f"{USERNAME}@{SERVER_IP}",
+        ]
 
     # 1) Быстрая попытка только по ключу (не зависнуть на вводе пароля).
-    proc = subprocess.run(base_cmd + ["-o", "BatchMode=yes"], input=batch, text=True)
+    proc = subprocess.run(build_cmd(batch_mode=True), input=batch, text=True)
     if proc.returncode == 0:
         return
 
     # 2) Если ключ не установлен, но запуск интерактивный — дадим шанс ввести пароль.
     if sys.stdin.isatty():
         print("[client] Key auth failed; falling back to interactive password prompt...")
-        proc2 = subprocess.run(base_cmd + ["-o", "BatchMode=no"], input=batch, text=True)
+        proc2 = subprocess.run(build_cmd(batch_mode=False), input=batch, text=True)
         if proc2.returncode == 0:
             return
         raise SystemExit(proc2.returncode)
