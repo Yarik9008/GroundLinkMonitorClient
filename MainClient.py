@@ -54,69 +54,110 @@ class LorettSFTPClient:
         remote_path = f"/{filename}"
         file_size = local_file.stat().st_size
 
-        print(f"[client] Connecting to {self.host}:{self.port}...")
+        def _is_winerror_121(exc: BaseException) -> bool:
+            if not isinstance(exc, OSError):
+                return False
+            if getattr(exc, "winerror", None) == 121:
+                return True
+            if getattr(exc, "errno", None) == 121:
+                return True
+            return "WinError 121" in str(exc)
 
-        async with asyncssh.connect(
-            self.host,
-            port=self.port,
-            username=self.username,
-            password=self.password,
-            known_hosts=None,  # demo / no host key verification
-            rekey_bytes=REKEY_BYTES,
-            compression_algs=COMPRESSION_ALGS,
-            encryption_algs=ENCRYPTION_ALGS,
-        ) as conn:
-            print("[client] Connected! Starting SFTP session...")
+        max_attempts = 5
+        backoff = 2.0
 
-            async with conn.start_sftp_client() as sftp:
-                print(f"[client] File: {filename} ({format_bytes(file_size)})")
+        for attempt in range(1, max_attempts + 1):
+            print(f"[client] Connecting to {self.host}:{self.port}... (attempt {attempt}/{max_attempts})")
+            try:
+                async with asyncssh.connect(
+                    self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    known_hosts=None,  # demo / no host key verification
+                    rekey_bytes=REKEY_BYTES,
+                    compression_algs=COMPRESSION_ALGS,
+                    encryption_algs=ENCRYPTION_ALGS,
+                    # Keepalives reduce chance of long-transfer timeouts
+                    keepalive_interval=15,
+                    keepalive_count_max=3,
+                ) as conn:
+                    print("[client] Connected! Starting SFTP session...")
 
-                with tqdm(
-                    total=file_size,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    desc=f"Uploading {filename}",
-                    ncols=80,
-                    # Make UI updates cheap (Windows console is slow).
-                    # We also throttle in progress_handler by bytes.
-                    mininterval=1.0,
-                    smoothing=0,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                    disable=not sys.stderr.isatty(),
-                ) as pbar:
-                    # Fast path: asyncssh optimized uploader
-                    block_size = 4 * 1024 * 1024  # 4 MiB
-                    # Too many in-flight requests can hurt throughput on some links/servers.
-                    # 128 is a good high-throughput default; tune if needed.
-                    max_requests = 128
+                    async with conn.start_sftp_client() as sftp:
+                        # best-effort cleanup of partial file from previous attempts
+                        if attempt > 1:
+                            try:
+                                await sftp.remove(remote_path)
+                            except Exception:
+                                pass
 
-                    progress_step = 16 * 1024 * 1024  # update every 16 MiB
-                    last_reported = 0
+                        print(f"[client] File: {filename} ({format_bytes(file_size)})")
 
-                    def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
-                        nonlocal last_reported
-                        if bytes_copied < last_reported:
-                            return
-                        delta = bytes_copied - last_reported
-                        if delta >= progress_step or bytes_copied >= total_bytes:
-                            pbar.update(delta)
-                            last_reported = bytes_copied
+                        with tqdm(
+                            total=file_size,
+                            unit="B",
+                            unit_scale=True,
+                            unit_divisor=1024,
+                            desc=f"Uploading {filename}",
+                            ncols=80,
+                            # Make UI updates cheap (Windows console is slow).
+                            mininterval=1.0,
+                            smoothing=0,
+                            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                            disable=not sys.stderr.isatty(),
+                        ) as pbar:
+                            block_size = 4 * 1024 * 1024  # 4 MiB
+                            max_requests = 128
 
-                    await sftp.put(
-                        str(local_file),
-                        remote_path,
-                        block_size=block_size,
-                        max_requests=max_requests,
-                        progress_handler=progress_handler,
-                    )
-                    # Ensure bar ends at 100%
-                    if last_reported < file_size:
-                        pbar.update(file_size - last_reported)
+                            progress_step = 16 * 1024 * 1024  # update every 16 MiB
+                            last_reported = 0
 
-                print("[client] ✓ Upload complete!")
-                attrs = await sftp.stat(remote_path)
-                print(f"[client] Remote file size: {format_bytes(attrs.size)}")
+                            def progress_handler(_src: bytes, _dst: bytes, bytes_copied: int, total_bytes: int) -> None:
+                                nonlocal last_reported
+                                if bytes_copied < last_reported:
+                                    return
+                                delta = bytes_copied - last_reported
+                                if delta >= progress_step or bytes_copied >= total_bytes:
+                                    pbar.update(delta)
+                                    last_reported = bytes_copied
+
+                            await sftp.put(
+                                str(local_file),
+                                remote_path,
+                                block_size=block_size,
+                                max_requests=max_requests,
+                                progress_handler=progress_handler,
+                            )
+                            if last_reported < file_size:
+                                pbar.update(file_size - last_reported)
+
+                        print("[client] ✓ Upload complete!")
+                        attrs = await sftp.stat(remote_path)
+                        print(f"[client] Remote file size: {format_bytes(attrs.size)}")
+                        return
+            except asyncssh.PermissionDenied:
+                print("[client] Error: Permission denied (check username/password)")
+                raise SystemExit(1)
+            except asyncssh.Error as e:
+                cause = getattr(e, "__cause__", None)
+                if _is_winerror_121(e) or (cause is not None and _is_winerror_121(cause)):
+                    print("[client] Warning: WinError 121 (semaphore timeout). Retrying...")
+                else:
+                    print(f"[client] SSH Error: {e}")
+                    raise SystemExit(1)
+            except OSError as e:
+                if _is_winerror_121(e):
+                    print("[client] Warning: WinError 121 (semaphore timeout). Retrying...")
+                else:
+                    print(f"[client] OS Error: {e}")
+                    raise SystemExit(1)
+
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+            else:
+                raise SystemExit("[client] Failed after retries (WinError 121).")
 
 
 async def main():
